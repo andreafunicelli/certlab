@@ -351,3 +351,28 @@ There is no "rotate KEK" procedure. Changing `secrets/cdp_master_key` in place m
 No restoration test has been recorded for this document yet.
 
 <!-- RESTORE_TEST_RESULTS -->
+**Restoration test, executed 2026-11-02** (development stack, not the Compose images, which could not be built in
+the test environment):
+
+1. `pg_dump -Fc` of the live `cdp` database (12 servers, 13 credentials, 3 deployment backups, 6 certificate
+   versions, 179 audit events) and a `tar` of the artifact directory.
+2. Restored with `pg_restore --no-owner` into a fresh database `cdp_restore` and a fresh, empty artifact directory.
+3. Ran `python -m scripts.verify_restore --ssh` (in `backend/`) against the restored copy with the original master key:
+   - schema revision `0004` (head)
+   - **3/3 deployment backups verified**: manifest HMAC plus decrypt and SHA-256 of every file
+   - **6/6 certificate versions decrypted**
+   - **11/13 SSH credentials decrypted**, and **11 live SSH connection tests passed** from the restored data
+   - The 2 failing credentials fail identically in the *source* database. They were encrypted under an earlier
+     development master key that was later replaced. This shows the key-loss property: data encrypted under a lost
+     key cannot be recovered, even from a correct backup.
+4. Same restored copy with a **wrong master key**: 0 backups, 0 credentials and 0 versions decrypt, and the script
+   exits non-zero. A database and artifact backup is useless without the separately stored key.
+
+Run the same check after any real restore:
+
+```bash
+docker compose run --rm api python -m scripts.verify_restore --ssh
+```
+
+The Compose command above has not been run, because the images could not be built here.
+

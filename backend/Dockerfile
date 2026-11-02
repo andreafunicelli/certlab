@@ -15,6 +15,7 @@ COPY --from=build /opt/venv /opt/venv
 WORKDIR /app
 COPY --chown=cdp:cdp app ./app
 COPY --chown=cdp:cdp alembic ./alembic
+COPY --chown=cdp:cdp scripts ./scripts
 COPY --chown=cdp:cdp alembic.ini ./
 USER cdp
 EXPOSE 8000

@@ -1,6 +1,6 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
-import { ArrowLeft, Pencil, PlugZap, Power, Radar, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowLeft, Pencil, PlugZap, Power, Radar, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { AppShell, PageHeader, Panel } from "@/components/layout/AppShell";
 import { DTable, THead, TH, TRow, TD } from "@/components/ui/dtable";
@@ -26,22 +26,27 @@ import {
 } from "@/components/ui/dialog";
 import { HostKeyPanel } from "@/components/servers/HostKeyPanel";
 import { ConnectionTestPanel } from "@/components/servers/ConnectionTestPanel";
+import { DiscoveryPanel } from "@/components/discovery/DiscoveryPanel";
+import { InstallationsTable } from "@/components/certificates/InstallationsTable";
+import { JobStatusBadge } from "@/components/ui/status";
 import {
   useCredentials,
   useDeleteServer,
   useDiscoverServer,
   useEnvironments,
   useServer,
+  useServerDeployments,
   useServerInstallations,
   useServers,
+  useSettings,
   useSetServerEnabled,
   useTestConnection,
   useUpdateServer,
 } from "@/lib/api/queries";
-import { ApiError, isApiError } from "@/lib/api/client";
+import { isApiError } from "@/lib/api/client";
 import type { ConnectionTestResult, Server } from "@/lib/api/types";
 import { useCan } from "@/lib/auth";
-import { detectedServices, fmtAgo, fmtDateTime } from "@/lib/format";
+import { detectedServices, fmtAgo, fmtDateTime, fmtDuration, shortFp } from "@/lib/format";
 
 export const Route = createFileRoute("/servers/$id")({
   head: () => ({
@@ -76,6 +81,9 @@ function ServerDetail() {
   const [editOpen, setEditOpen] = useState(false);
   const [delOpen, setDelOpen] = useState(false);
   const inst = useServerInstallations(id);
+  const deps = useServerDeployments(id);
+  const refreshMinutes = Number(useSettings().data?.general.data["inventory_refresh_minutes"] ?? 0);
+  const [jobId, setJobId] = useState<string | null>(null);
 
   const runTest = () =>
     testConn.mutate(id, {
@@ -92,14 +100,17 @@ function ServerDetail() {
 
   const runDiscover = () =>
     discover.mutate(id, {
-      onSuccess: () =>
-        toast.success("Discovery started", { description: "Results will appear on this page." }),
+      onSuccess: (job) => {
+        setJobId(job.id);
+        toast.success("Discovery started", { description: "Progress is shown below." });
+      },
       onError: (e) => {
-        if (isApiError(e) && (e.status === 501 || e.status === 404))
-          toast.info("Discovery is not available yet", {
-            description: "This feature is not enabled in this build.",
-          });
-        else toast.error("Could not start discovery", { description: errorMessage(e) });
+        const running = isApiError(e) && e.code === "DISCOVERY_ALREADY_RUNNING";
+        const existing = running ? (e.details as { job_id?: string } | null)?.job_id : undefined;
+        if (existing) {
+          setJobId(existing);
+          toast.info("Discovery is already running", { description: "Showing its progress." });
+        } else toast.error("Could not start discovery", { description: errorMessage(e) });
       },
     });
 
@@ -127,8 +138,10 @@ function ServerDetail() {
     );
 
   const services = detectedServices(server.detected_services);
-  const instNotAvailable =
-    inst.error instanceof ApiError && [404, 405, 501].includes(inst.error.status);
+  const lastDisc = server.last_discovery_at ? new Date(server.last_discovery_at).getTime() : null;
+  const staleInventory =
+    server.enabled &&
+    (lastDisc === null || (refreshMinutes > 0 && Date.now() - lastDisc > refreshMinutes * 60_000));
   const sub = [
     server.hostname,
     server.os_pretty,
@@ -297,14 +310,26 @@ function ServerDetail() {
             )}
           </Panel>
 
+          {staleInventory && (
+            <div
+              className="flex items-start gap-2 rounded-md border border-warn/40 bg-warn-soft p-2.5 text-[12px]"
+              data-testid="stale-inventory"
+            >
+              <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warn" />
+              <span>
+                {lastDisc === null
+                  ? "This server has never been scanned, so its certificate inventory is empty."
+                  : `Certificate inventory is stale: last scan ${fmtAgo(server.last_discovery_at)}${refreshMinutes ? ` (refresh interval ${refreshMinutes} min)` : ""}.`}{" "}
+                {canDiscover && "Run “Scan Certificates” to refresh it before deploying."}
+              </span>
+            </div>
+          )}
+
+          <DiscoveryPanel serverId={id} jobId={jobId} />
+
           <Panel title="Certificates installed on this server">
             {inst.isLoading ? (
               <LoadingBlock />
-            ) : instNotAvailable ? (
-              <EmptyState
-                title="Installation inventory not available yet"
-                hint="Certificate installations are populated by discovery, which is not enabled in this build."
-              />
             ) : inst.isError ? (
               <ErrorState error={inst.error} onRetry={() => void inst.refetch()} />
             ) : !inst.data || inst.data.length === 0 ? (
@@ -313,25 +338,57 @@ function ServerDetail() {
                 hint="Run “Scan Certificates” to discover certificate references in the web server configuration."
               />
             ) : (
+              <InstallationsTable rows={inst.data} context="server" />
+            )}
+          </Panel>
+
+          <Panel title="Recent deployments">
+            {deps.isLoading ? (
+              <LoadingBlock />
+            ) : deps.isError ? (
+              <ErrorState error={deps.error} onRetry={() => void deps.refetch()} />
+            ) : (deps.data?.items.length ?? 0) === 0 ? (
+              <EmptyState title="No deployments to this server yet" />
+            ) : (
               <DTable>
                 <THead>
-                  <TH>Domain</TH>
-                  <TH>Certificate Path</TH>
-                  <TH>Key Path</TH>
-                  <TH>Service</TH>
+                  <TH>Date</TH>
+                  <TH>Certificate</TH>
+                  <TH>User</TH>
+                  <TH align="right">Duration</TH>
                   <TH>Status</TH>
                 </THead>
                 <tbody>
-                  {inst.data.map((r) => (
-                    <TRow key={r.id}>
-                      <TD className="mono">
-                        {str(r["common_name"] ?? r["domain"] ?? r["certificate_cn"])}
-                      </TD>
-                      <TD className="mono">{str(r["certificate_path"] ?? r["cert_path"])}</TD>
-                      <TD className="mono">{str(r["key_path"] ?? r["private_key_path"])}</TD>
-                      <TD className="mono">{str(r["service"] ?? r["service_type"])}</TD>
+                  {deps.data?.items.map((d) => (
+                    <TRow key={d.id}>
                       <TD>
-                        <Pill tone="neutral">{str(r["classification"] ?? r["status"])}</Pill>
+                        <Link
+                          to="/deployments/$id"
+                          params={{ id: d.id }}
+                          className="mono text-foreground hover:text-primary hover:underline"
+                        >
+                          {fmtDateTime(d.created_at)}
+                        </Link>
+                      </TD>
+                      <TD className="mono">
+                        {d.certificate_id ? (
+                          <Link
+                            to="/certificates/$id"
+                            params={{ id: d.certificate_id }}
+                            className="hover:text-primary hover:underline"
+                          >
+                            {shortFp(d.new_fingerprint)}
+                          </Link>
+                        ) : (
+                          shortFp(d.new_fingerprint)
+                        )}
+                      </TD>
+                      <TD className="text-muted-foreground">{d.initiated_by_name ?? "system"}</TD>
+                      <TD align="right" className="mono">
+                        {d.started_at ? fmtDuration(d.started_at, d.finished_at) : "—"}
+                      </TD>
+                      <TD>
+                        <JobStatusBadge status={d.status} />
                       </TD>
                     </TRow>
                   ))}

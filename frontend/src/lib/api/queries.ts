@@ -10,6 +10,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import {
+  API_BASE,
   ApiError,
   del,
   get,
@@ -22,24 +23,32 @@ import {
 } from "./client";
 import type {
   AuditEvent,
+  Backup,
+  CertificateDetail,
+  CertificateSummary,
+  CertificateVerifyResult,
   ConnectionTestResult,
   Credential,
   DashboardSummary,
+  DeploymentJob,
+  DeploymentPlan,
   DiscoveryJob,
   Environment,
   EnvironmentCreate,
   EnvironmentUpdate,
   ExpiryTrend,
   HostKeyScan,
+  Installation,
   Me,
   Page,
-  Row,
   Server,
   ServerCreate,
   ServerUpdate,
   SettingsSection,
   SettingsSectionName,
+  UploadedVersion,
   User,
+  VerificationRecord,
 } from "./types";
 
 // -------------------------------------------------------------------------------------------
@@ -61,7 +70,6 @@ export const qk = {
     summary: ["dashboard", "summary"] as const,
     trend: ["dashboard", "expiry-trend"] as const,
   },
-  // not wired yet (follow-up stream)
   certificates: {
     all: ["certificates"] as const,
     list: (p?: Query) => ["certificates", "list", p ?? {}] as const,
@@ -69,17 +77,22 @@ export const qk = {
   },
   installations: {
     all: ["installations"] as const,
-    detail: (id: string) => ["installations", id] as const,
+    list: (p?: Query) => ["installations", "list", p ?? {}] as const,
   },
   deployments: {
     all: ["deployments"] as const,
     list: (p?: Query) => ["deployments", "list", p ?? {}] as const,
     detail: (id: string) => ["deployments", "detail", id] as const,
+    forServer: (id: string, p?: Query) => ["deployments", "server", id, p ?? {}] as const,
   },
-  backups: { all: ["backups"] as const, detail: (id: string) => ["backups", id] as const },
+  backups: {
+    all: ["backups"] as const,
+    list: (p?: Query) => ["backups", "list", p ?? {}] as const,
+  },
   discoveryJobs: {
     all: ["discovery-jobs"] as const,
-    detail: (id: string) => ["discovery-jobs", id] as const,
+    detail: (id: string) => ["discovery-jobs", "detail", id] as const,
+    forServer: (id: string) => ["discovery-jobs", "server", id] as const,
   },
   notifications: {
     channels: ["notifications", "channels"] as const,
@@ -163,9 +176,12 @@ export const api = {
     ) => post<Server>(`/servers/${id}/host-key/enroll`, b),
     testConnection: (id: string) => post<ConnectionTestResult>(`/servers/${id}/test-connection`),
     discover: (id: string) => post<DiscoveryJob>(`/servers/${id}/discover`),
-    installations: (id: string) => get<Page<Row> | Row[]>(`/servers/${id}/installations`),
-    deployments: (id: string) => get<Page<Row>>(`/servers/${id}/deployments`),
-    discoveryJobs: (id: string) => get<Page<Row>>(`/servers/${id}/discovery-jobs`),
+    installations: (id: string, q?: Query) =>
+      get<Page<Installation>>(`/servers/${id}/installations`, { page_size: 200, ...q }),
+    deployments: (id: string, q?: Query) =>
+      get<Page<DeploymentJob>>(`/servers/${id}/deployments`, q),
+    discoveryJobs: (id: string, q?: Query) =>
+      get<Page<DiscoveryJob>>(`/servers/${id}/discovery-jobs`, q),
   },
   environments: {
     list: () => get<Environment[]>("/environments"),
@@ -184,59 +200,62 @@ export const api = {
     expiryTrend: () => get<ExpiryTrend>("/dashboard/expiry-trend"),
   },
 
-  // ---- Scaffolding for endpoints being implemented by other streams (see docs/PROGRESS.md section 3).
-  // Loosely typed on purpose; tighten with `bun run gen:api` once the OpenAPI spec contains them.
   certificates: {
-    list: (q?: Query) => get<Page<Row>>("/certificates", q),
-    get: (id: string) => get<Row>(`/certificates/${id}`),
-    verify: (id: string) => post<Row>(`/certificates/${id}/verify`),
+    list: (q?: Query) => get<Page<CertificateSummary>>("/certificates", q),
+    get: (id: string) => get<CertificateDetail>(`/certificates/${id}`),
+    verify: (id: string) => post<CertificateVerifyResult>(`/certificates/${id}/verify`),
   },
   installations: {
-    list: (q?: Query) => get<Page<Row>>("/installations", q),
-    get: (id: string) => get<Row>(`/installations/${id}`),
-    update: (id: string, b: Record<string, unknown>) => patch<Row>(`/installations/${id}`, b),
-    verify: (id: string) => post<Row>(`/installations/${id}/verify`),
+    list: (q?: Query) => get<Page<Installation>>("/installations", q),
+    get: (id: string) => get<Installation>(`/installations/${id}`),
+    update: (id: string, b: Record<string, unknown>) =>
+      patch<Installation>(`/installations/${id}`, b),
+    verify: (id: string) => post<VerificationRecord>(`/installations/${id}/verify`),
   },
   certificateVersions: {
-    upload: (form: FormData) => postForm<Row>("/certificate-versions", form),
-    get: (id: string) => get<Row>(`/certificate-versions/${id}`),
+    /** Key material is sent once, as multipart; callers must not keep it in state afterwards. */
+    upload: (form: FormData) => postForm<UploadedVersion>("/certificate-versions", form),
+    get: (id: string) => get<UploadedVersion>(`/certificate-versions/${id}`),
     validate: (id: string, installation_ids: string[]) =>
-      post<Row>(`/certificate-versions/${id}/validate`, { installation_ids }),
+      post<UploadedVersion>(`/certificate-versions/${id}/validate`, { installation_ids }),
   },
   deployments: {
-    list: (q?: Query) => get<Page<Row>>("/deployments", q),
-    get: (id: string) => get<Row>(`/deployments/${id}`),
-    plan: (b: Record<string, unknown>) => post<Row>("/deployments/plan", b),
-    create: (b: Record<string, unknown>, idempotencyKey: string) =>
-      request<Row>("/deployments", {
+    list: (q?: Query) => get<Page<DeploymentJob>>("/deployments", q),
+    get: (id: string) => get<DeploymentJob>(`/deployments/${id}`),
+    plan: (b: DeploymentRequest) => post<DeploymentPlan>("/deployments/plan", b),
+    create: (b: DeploymentRequest, idempotencyKey: string) =>
+      request<DeploymentJob>("/deployments", {
         method: "POST",
         json: b,
         headers: { "Idempotency-Key": idempotencyKey },
       }),
-    approve: (id: string) => post<Row>(`/deployments/${id}/approve`),
-    cancel: (id: string) => post<Row>(`/deployments/${id}/cancel`),
-    retry: (id: string) => post<Row>(`/deployments/${id}/retry`),
+    approve: (id: string) => post<DeploymentJob>(`/deployments/${id}/approve`),
+    cancel: (id: string) => post<DeploymentJob>(`/deployments/${id}/cancel`),
+    retry: (id: string) => post<DeploymentJob>(`/deployments/${id}/retry`),
     rollback: (id: string, targetId: string) =>
-      post<Row>(`/deployments/${id}/targets/${enc(targetId)}/rollback`),
+      post<{ ok: boolean; result: unknown }>(
+        `/deployments/${id}/targets/${enc(targetId)}/rollback`,
+      ),
     /** SSE endpoint URL for EventSource (same origin, cookie auth). */
-    eventsUrl: (id: string) => `/api/v1/deployments/${id}/events`,
+    eventsUrl: (id: string) => `${API_BASE}/deployments/${id}/events`,
   },
   backups: {
-    list: (q?: Query) => get<Page<Row>>("/backups", q),
-    get: (id: string) => get<Row>(`/backups/${id}`),
-    restore: (id: string) => post<Row>(`/backups/${id}/restore`),
-    downloadUrl: (id: string) => `/api/v1/backups/${id}/download`,
+    list: (q?: Query) => get<Page<Backup>>("/backups", q),
+    get: (id: string) => get<Backup>(`/backups/${id}`),
+    restore: (id: string) =>
+      post<{ ok: boolean; result: unknown; backup: Backup }>(`/backups/${id}/restore`),
   },
   discoveryJobs: {
-    list: (q?: Query) => get<Page<Row>>("/discovery-jobs", q),
-    get: (id: string) => get<Row>(`/discovery-jobs/${id}`),
-    bulk: (server_ids: string[]) => post<Row>("/discovery-jobs/bulk", { server_ids }),
+    list: (q?: Query) => get<Page<DiscoveryJob>>("/discovery-jobs", q),
+    get: (id: string) => get<DiscoveryJob>(`/discovery-jobs/${id}`),
+    bulk: (server_ids: string[]) => post<unknown>("/discovery-jobs/bulk", { server_ids }),
+    eventsUrl: (id: string) => `${API_BASE}/discovery-jobs/${id}/events`,
   },
   notifications: {
-    channels: () => get<Row[] | Page<Row>>("/notifications/channels"),
-    rules: () => get<Row[] | Page<Row>>("/notifications/rules"),
-    deliveries: (q?: Query) => get<Page<Row>>("/notifications/deliveries", q),
-    testChannel: (id: string) => post<Row>(`/notifications/channels/${id}/test`),
+    channels: () => get<unknown[] | Page<unknown>>("/notifications/channels"),
+    rules: () => get<unknown[] | Page<unknown>>("/notifications/rules"),
+    deliveries: (q?: Query) => get<Page<unknown>>("/notifications/deliveries", q),
+    testChannel: (id: string) => post<unknown>(`/notifications/channels/${id}/test`),
   },
 };
 
@@ -259,15 +278,10 @@ export const useServers = (params?: Query) =>
   });
 export const useServer = (id: string) =>
   useQuery({ queryKey: qk.servers.detail(id), queryFn: () => api.servers.get(id) });
-/** Installations on a server; the endpoint may not exist yet (404/501) -> `data` stays undefined and `error.status` tells why. */
 export const useServerInstallations = (id: string) =>
   useQuery({
     queryKey: qk.servers.installations(id),
-    queryFn: async () => {
-      const r = await api.servers.installations(id);
-      return Array.isArray(r) ? r : r.items;
-    },
-    retry: (n, e) => !(e instanceof ApiError && [404, 405, 501].includes(e.status)) && n < 1,
+    queryFn: async () => (await api.servers.installations(id)).items,
   });
 export const useEnvironments = () =>
   useQuery({ queryKey: qk.environments, queryFn: api.environments.list });
@@ -362,7 +376,13 @@ export function useTestConnection() {
 }
 export function useDiscoverServer() {
   const qc = useQueryClient();
-  return useMutation({ mutationFn: api.servers.discover, onSettled: () => invalidateServers(qc) });
+  return useMutation({
+    mutationFn: api.servers.discover,
+    onSettled: (_d, _e, id) => {
+      invalidateServers(qc);
+      void qc.invalidateQueries({ queryKey: qk.discoveryJobs.forServer(id) });
+    },
+  });
 }
 
 export function useCreateCredential() {
@@ -459,3 +479,136 @@ export function useUpdateSettings() {
     },
   });
 }
+
+// -------------------------------------------------------------------------------------------
+// Certificates, installations, versions
+export const useCertificates = (params?: Query) =>
+  useQuery({
+    queryKey: qk.certificates.list(params),
+    queryFn: () => api.certificates.list(params),
+    placeholderData: keepPreviousData,
+  });
+export const useCertificate = (id: string | null | undefined) =>
+  useQuery({
+    queryKey: qk.certificates.detail(id ?? ""),
+    queryFn: () => api.certificates.get(id as string),
+    enabled: !!id,
+  });
+
+/** Everything that may change after inventory-affecting writes (verify, deploy, restore, discovery). */
+export const invalidateInventory = (qc: QueryClient) => {
+  void qc.invalidateQueries({ queryKey: qk.certificates.all });
+  void qc.invalidateQueries({ queryKey: qk.installations.all });
+  void qc.invalidateQueries({ queryKey: qk.servers.all });
+  void qc.invalidateQueries({ queryKey: qk.dashboard.summary });
+  void qc.invalidateQueries({ queryKey: qk.dashboard.trend });
+  void qc.invalidateQueries({ queryKey: ["audit-events"] });
+};
+
+export function useVerifyCertificate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.certificates.verify,
+    onSettled: () => invalidateInventory(qc),
+  });
+}
+export function useVerifyInstallation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.installations.verify,
+    onSettled: () => invalidateInventory(qc),
+  });
+}
+export function useUpdateInstallation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...b }: { id: string } & Record<string, unknown>) =>
+      api.installations.update(id, b),
+    onSuccess: () => invalidateInventory(qc),
+  });
+}
+
+// -------------------------------------------------------------------------------------------
+// Deployments
+export interface DeploymentRequest {
+  version_id: string;
+  installation_ids: string[];
+  strategy: {
+    mode: "canary" | "batch" | "all";
+    concurrency: number;
+    failure_threshold: number;
+    continue_on_failure: boolean;
+    allow_restart: boolean;
+    allow_file_only_verification: boolean;
+  };
+  acknowledged_warnings: string[];
+}
+
+export const useDeployments = (params?: Query) =>
+  useQuery({
+    queryKey: qk.deployments.list(params),
+    queryFn: () => api.deployments.list(params),
+    placeholderData: keepPreviousData,
+  });
+export const useDeployment = (id: string) =>
+  useQuery({ queryKey: qk.deployments.detail(id), queryFn: () => api.deployments.get(id) });
+export const useServerDeployments = (id: string) =>
+  useQuery({
+    queryKey: qk.deployments.forServer(id),
+    queryFn: () => api.servers.deployments(id, { page_size: 10 }),
+  });
+
+export const invalidateDeployments = (qc: QueryClient) => {
+  void qc.invalidateQueries({ queryKey: qk.deployments.all });
+  void qc.invalidateQueries({ queryKey: qk.backups.all });
+  invalidateInventory(qc);
+};
+
+export function usePlanDeployment() {
+  return useMutation({ mutationFn: api.deployments.plan });
+}
+export function useCreateDeployment() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ body, key }: { body: DeploymentRequest; key: string }) =>
+      api.deployments.create(body, key),
+    onSuccess: (job) => {
+      qc.setQueryData(qk.deployments.detail(job.id), job);
+      invalidateDeployments(qc);
+    },
+  });
+}
+export function useDeploymentActions() {
+  const qc = useQueryClient();
+  const done = () => invalidateDeployments(qc);
+  return {
+    approve: useMutation({ mutationFn: api.deployments.approve, onSuccess: done }),
+    cancel: useMutation({ mutationFn: api.deployments.cancel, onSuccess: done }),
+    retry: useMutation({ mutationFn: api.deployments.retry, onSuccess: done }),
+    rollback: useMutation({
+      mutationFn: ({ id, targetId }: { id: string; targetId: string }) =>
+        api.deployments.rollback(id, targetId),
+      onSettled: done,
+    }),
+  };
+}
+
+export const useBackups = (params?: Query, enabled = true) =>
+  useQuery({
+    queryKey: qk.backups.list(params),
+    queryFn: () => api.backups.list(params),
+    enabled,
+  });
+export function useRestoreBackup() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.backups.restore,
+    onSettled: () => invalidateDeployments(qc),
+  });
+}
+
+export const useServerDiscoveryJobs = (id: string) =>
+  useQuery({
+    queryKey: qk.discoveryJobs.forServer(id),
+    queryFn: () => api.servers.discoveryJobs(id, { page_size: 5 }),
+  });

@@ -42,7 +42,10 @@ export function Pill({
 
 const certToneMap: Record<string, { tone: Tone; label: string }> = {
   valid: { tone: "ok", label: "Valid" },
+  info: { tone: "info", label: "Renew Soon" },
+  warning: { tone: "warn", label: "Expiring Soon" },
   expiring: { tone: "warn", label: "Expiring Soon" },
+  high: { tone: "crit", label: "High" },
   critical: { tone: "crit", label: "Critical" },
   expired: { tone: "danger", label: "Expired" },
   error: { tone: "danger", label: "Deployment Error" },
@@ -134,3 +137,74 @@ export function OutcomePill({ outcome }: { outcome: string }) {
     </Pill>
   );
 }
+
+const classTone: Record<string, { tone: Tone; label: string }> = {
+  managed: { tone: "ok", label: "Managed" },
+  unmanaged: { tone: "neutral", label: "Unmanaged" },
+  requires_mapping: { tone: "warn", label: "Needs mapping" },
+  unsupported: { tone: "neutral", label: "Unsupported" },
+  unreadable: { tone: "danger", label: "Unreadable" },
+  error: { tone: "danger", label: "Error" },
+};
+export function ClassificationBadge({ value, certbot }: { value: string; certbot?: boolean }) {
+  if (certbot)
+    return (
+      <Pill tone="neutral" dot>
+        Certbot-managed
+      </Pill>
+    );
+  const m = classTone[value] ?? { tone: "neutral" as Tone, label: value };
+  return (
+    <Pill tone={m.tone} dot>
+      {m.label}
+    </Pill>
+  );
+}
+
+const driftTone: Record<string, { tone: Tone; label: string }> = {
+  in_sync: { tone: "ok", label: "In sync" },
+  drifted: { tone: "warn", label: "Drifted" },
+  missing: { tone: "danger", label: "Missing" },
+  unknown: { tone: "neutral", label: "Unknown" },
+};
+export function DriftBadge({ value }: { value: string }) {
+  const m = driftTone[value] ?? { tone: "neutral" as Tone, label: value };
+  return (
+    <Pill tone={m.tone} dot>
+      {m.label}
+    </Pill>
+  );
+}
+
+const jobTone: Record<string, { tone: Tone; label: string }> = {
+  pending: { tone: "neutral", label: "Pending" },
+  awaiting_approval: { tone: "warn", label: "Awaiting approval" },
+  preflight: { tone: "info", label: "Pre-flight" },
+  activating: { tone: "info", label: "Running" },
+  completed: { tone: "ok", label: "Completed" },
+  partially_failed: { tone: "warn", label: "Partially failed" },
+  failed: { tone: "danger", label: "Failed" },
+  rolled_back: { tone: "warn", label: "Rolled back" },
+  manual_intervention_required: { tone: "danger", label: "Manual intervention" },
+  cancelled: { tone: "neutral", label: "Cancelled" },
+};
+/** Deployment job / target status. Unknown in-flight target states (backing_up, staging, ...) render as "running". */
+export function JobStatusBadge({ status }: { status: string }) {
+  const m = jobTone[status] ?? {
+    tone: "info" as Tone,
+    label: status.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase()),
+  };
+  return (
+    <Pill tone={m.tone} dot>
+      {m.label}
+    </Pill>
+  );
+}
+export const FINAL_STATUSES = new Set([
+  "completed",
+  "failed",
+  "rolled_back",
+  "cancelled",
+  "partially_failed",
+  "manual_intervention_required",
+]);

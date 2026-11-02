@@ -1,3 +1,7 @@
+/**
+ * DEMO / TEST ONLY: static sample data from the original Lovable prototype.
+ * NOT imported by any route or component; the app talks to the real API (src/lib/api). Safe to delete.
+ */
 // DEMO/TEST ONLY — static fixtures from the original Lovable prototype. Real pages use src/lib/api/*.
 // Still imported only by routes that are not wired to the API yet (certificates, expirations, deployments, renew wizard).
 export type CertStatus =

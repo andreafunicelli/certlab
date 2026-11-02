@@ -1,47 +1,38 @@
-import { createFileRoute, Link, notFound } from "@tanstack/react-router";
-import {
-  ArrowLeft,
-  CheckCircle2,
-  Download,
-  FileKey2,
-  FileText,
-  Layers,
-  Lock,
-  RefreshCw,
-  Rocket,
-} from "lucide-react";
+import { createFileRoute, Link } from "@tanstack/react-router";
+import { useState } from "react";
+import { ArrowLeft, Download, RefreshCw, RotateCcw, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import { AppShell, PageHeader, Panel } from "@/components/layout/AppShell";
 import { DTable, THead, TH, TRow, TD } from "@/components/ui/dtable";
-import { CertStatusBadge, DaysLeft, EnvBadge, Pill } from "@/components/ui/status";
-import { getCertificate } from "@/lib/mock-data";
+import { CertStatusBadge, DaysLeft, JobStatusBadge, Pill } from "@/components/ui/status";
+import { ConfirmDialog } from "@/components/ui/confirm";
+import {
+  btnCls,
+  btnDangerCls,
+  EmptyState,
+  ErrorState,
+  errorMessage,
+  LoadingBlock,
+  Spinner,
+} from "@/components/ui/feedback";
+import { InstallationsTable } from "@/components/certificates/InstallationsTable";
+import { useReauthGate } from "@/components/auth/useReauthGate";
+import { useCertificate, useRestoreBackup, useVerifyCertificate } from "@/lib/api/queries";
+import { isApiError } from "@/lib/api/client";
+import type { CertificateDetail as Cert } from "@/lib/api/types";
+import { useCan } from "@/lib/auth";
+import { fmtAgo, fmtDate, fmtDateTime, shortFp } from "@/lib/format";
 
 export const Route = createFileRoute("/certificates/$id/")({
-  loader: ({ params }) => {
-    const cert = getCertificate(params.id);
-    if (!cert) throw notFound();
-    return { cert };
-  },
-  head: ({ loaderData }) => {
-    if (!loaderData) {
-      return {
-        meta: [
-          { title: "Certificate unavailable — Certificate Manager" },
-          { name: "robots", content: "noindex" },
-        ],
-      };
-    }
-    const t = `${loaderData.cert.commonName} — Certificate Manager`;
-    const d = `Certificate details, files and installations for ${loaderData.cert.commonName} issued by ${loaderData.cert.ca}.`;
-    return {
-      meta: [
-        { title: t },
-        { name: "description", content: d },
-        { property: "og:title", content: t },
-        { property: "og:description", content: d },
-      ],
-    };
-  },
+  head: () => ({
+    meta: [
+      { title: "Certificate — Certificate Manager" },
+      {
+        name: "description",
+        content: "Certificate details, installations, versions, deployments and backups.",
+      },
+    ],
+  }),
   component: CertificateDetail,
 });
 
@@ -58,49 +49,77 @@ function Field({ label, value, mono }: { label: string; value: string; mono?: bo
   );
 }
 
-function FileRow({
-  icon: Icon,
-  label,
-  file,
-  secret,
-}: {
-  icon: typeof FileText;
-  label: string;
-  file: string;
-  secret?: boolean;
-}) {
-  return (
-    <div className="flex items-center gap-2.5 border-b border-border/60 px-3 py-2 last:border-0">
-      <Icon className="size-4 shrink-0 text-muted-foreground" />
-      <div className="min-w-0 flex-1">
-        <div className="text-[11.5px] uppercase tracking-[0.05em] text-muted-foreground">{label}</div>
-        <div className="mono truncate text-foreground">{file}</div>
-      </div>
-      {secret ? (
-        <Pill tone="info">
-          <Lock className="size-3" /> Stored securely
-        </Pill>
-      ) : (
-        <button
-          onClick={() => toast.success("Download started", { description: file })}
-          className="inline-flex items-center gap-1.5 rounded-sm border border-border px-1.5 py-0.5 text-[11.5px] hover:border-primary hover:text-primary"
-        >
-          <Download className="size-3" /> Download
-        </button>
-      )}
-    </div>
-  );
+function downloadPem(c: Cert) {
+  const blob = new Blob([c.pem], { type: "application/x-pem-file" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${c.common_name.replace(/[^a-zA-Z0-9.*_-]/g, "_")}.pem`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 function CertificateDetail() {
-  const { cert } = Route.useLoaderData();
+  const { id } = Route.useParams();
+  const q = useCertificate(id);
+  const verify = useVerifyCertificate();
+  const restore = useRestoreBackup();
+  const gate = useReauthGate("Restoring a backup requires a recent re-authentication.");
+  const canVerify = useCan("certificates:verify");
+  const canUpload = useCan("versions:upload");
+  const canRestore = useCan("backups:restore");
+  const [restoreId, setRestoreId] = useState<string | null>(null);
+  const cert = q.data;
 
-  const checks = [
-    { label: "Certificate", value: "Valid" },
-    { label: "Private Key Match", value: "Valid" },
-    { label: "Chain", value: "Valid" },
-    { label: "Expiration", value: cert.daysRemaining < 0 ? "Expired" : "Valid" },
-  ];
+  if (q.isLoading)
+    return (
+      <AppShell>
+        <LoadingBlock label="Loading certificate…" />
+      </AppShell>
+    );
+  if (q.isError || !cert)
+    return (
+      <AppShell>
+        <Link
+          to="/certificates"
+          className="mb-2 inline-flex items-center gap-1.5 text-[12px] text-muted-foreground hover:text-foreground"
+        >
+          <ArrowLeft className="size-3.5" /> Certificates
+        </Link>
+        {isApiError(q.error) && q.error.status === 404 ? (
+          <EmptyState
+            title="Certificate not found"
+            hint="It may have been removed from the inventory."
+          />
+        ) : (
+          <ErrorState error={q.error} onRetry={() => void q.refetch()} />
+        )}
+      </AppShell>
+    );
+
+  const serverName = new Map(
+    cert.installations.map((i) => [i.server_id, i.server_name ?? i.server_id.slice(0, 8)]),
+  );
+  const active = cert.installations.filter((i) => !i.missing_since);
+  const deployable = active.filter((i) => i.classification === "managed" && !i.managed_by_certbot);
+
+  const runVerify = () =>
+    verify.mutate(id, {
+      onSuccess: (r) => {
+        const s = r.summary;
+        if (s.total === 0)
+          toast.info("Nothing to verify", { description: "No verifiable installations." });
+        else if (s.mismatching || s.failed)
+          toast.warning("Verification found problems", {
+            description: `${s.matching} matching, ${s.mismatching} mismatching, ${s.failed} failed`,
+          });
+        else
+          toast.success("All endpoints serve the installed certificate", {
+            description: `${s.matching}/${s.total}`,
+          });
+      },
+      onError: (e) => toast.error("Verification failed", { description: errorMessage(e) }),
+    });
 
   return (
     <AppShell>
@@ -112,31 +131,33 @@ function CertificateDetail() {
       </Link>
 
       <PageHeader
-        title={<span className="mono text-[17px]">{cert.commonName}</span>}
-        badge={<CertStatusBadge status={cert.status} />}
-        subtitle={`${cert.name} · ${cert.ca} · installed on ${cert.installations.length} servers`}
+        title={<span className="mono text-[17px]">{cert.common_name}</span>}
+        badge={<CertStatusBadge status={cert.expiry_status} />}
+        subtitle={`${cert.issuer} · installed on ${cert.installation_count} location${cert.installation_count === 1 ? "" : "s"} across ${cert.server_count} server${cert.server_count === 1 ? "" : "s"}`}
         actions={
           <>
-            <button
-              onClick={() => toast.info("Re-validating certificate chain…")}
-              className="inline-flex h-7.5 items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 text-[12.5px] hover:border-primary hover:text-primary"
-            >
-              <CheckCircle2 className="size-3.5" /> Re-validate
+            {canVerify && (
+              <button
+                className={btnCls}
+                onClick={runVerify}
+                disabled={verify.isPending || active.length === 0}
+              >
+                {verify.isPending ? <Spinner /> : <ShieldCheck className="size-3.5" />} Verify
+                endpoints
+              </button>
+            )}
+            <button className={btnCls} onClick={() => downloadPem(cert)}>
+              <Download className="size-3.5" /> Public certificate
             </button>
-            <Link
-              to="/certificates/$id/renew"
-              params={{ id: cert.id }}
-              className="inline-flex h-7.5 items-center gap-1.5 rounded-md border border-border bg-surface px-2.5 text-[12.5px] hover:border-primary hover:text-primary"
-            >
-              <Rocket className="size-3.5" /> Deploy
-            </Link>
-            <Link
-              to="/certificates/$id/renew"
-              params={{ id: cert.id }}
-              className="inline-flex h-7.5 items-center gap-1.5 rounded-md bg-primary px-2.5 text-[12.5px] font-medium text-primary-foreground hover:opacity-90"
-            >
-              <RefreshCw className="size-3.5" /> Replace / Renew
-            </Link>
+            {canUpload && (
+              <Link
+                to="/certificates/$id/renew"
+                params={{ id: cert.id }}
+                className="inline-flex h-7.5 items-center gap-1.5 rounded-md bg-primary px-2.5 text-[12.5px] font-medium text-primary-foreground hover:opacity-90"
+              >
+                <RefreshCw className="size-3.5" /> Upload / Replace
+              </Link>
+            )}
           </>
         }
       />
@@ -144,105 +165,237 @@ function CertificateDetail() {
       <div className="grid gap-3 xl:grid-cols-3">
         <Panel title="Certificate Information" className="xl:col-span-2">
           <div className="px-3 py-1.5">
-            <Field label="Common Name" value={cert.commonName} mono />
-            <Field label="Subject Alternative Names" value={cert.sans.join(", ")} mono />
+            <Field label="Common Name" value={cert.common_name} mono />
+            <Field label="Subject Alternative Names" value={cert.sans.join(", ") || "—"} mono />
+            <Field label="Subject" value={cert.subject} />
             <Field label="Issuer" value={cert.issuer} />
-            <Field label="Serial Number" value={cert.serial} mono />
-            <Field label="SHA-256 Fingerprint" value={cert.fingerprint} mono />
-            <Field label="Signature Algorithm" value={cert.signatureAlgorithm} />
-            <Field label="Public Key Algorithm" value={cert.publicKeyAlgorithm} />
-            <Field label="Key Size" value={`${cert.publicKeyAlgorithm} ${cert.keySize}`} mono />
-            <Field label="Valid From" value={cert.validFrom} mono />
-            <Field label="Valid Until" value={cert.expiration} mono />
+            <Field label="Serial Number" value={cert.serial_number} mono />
+            <Field label="SHA-256 Fingerprint" value={cert.fingerprint_sha256} mono />
+            <Field label="Signature Algorithm" value={cert.signature_algorithm} />
+            <Field
+              label="Public Key"
+              value={`${cert.public_key_algorithm} ${cert.public_key_size ?? ""}`.trim()}
+              mono
+            />
+            <Field label="Valid From" value={fmtDateTime(cert.not_before)} mono />
+            <Field label="Valid Until" value={fmtDateTime(cert.not_after)} mono />
             <div className="flex items-baseline gap-3 py-1.5">
               <div className="w-52 shrink-0 text-[11.5px] uppercase tracking-[0.05em] text-muted-foreground">
                 Days Remaining
               </div>
-              <DaysLeft days={cert.daysRemaining} />
+              <DaysLeft days={cert.days_remaining} />
             </div>
           </div>
         </Panel>
 
         <div className="space-y-3">
-          <Panel title="Files" bodyClassName="">
-            <FileRow icon={FileText} label="Certificate" file={cert.files.cert} />
-            <FileRow icon={FileKey2} label="Private Key" file={cert.files.key} secret />
-            <FileRow icon={Layers} label="Intermediate Chain" file={cert.files.chain} />
-            <FileRow icon={Layers} label="Full Chain" file={cert.files.fullchain} />
-          </Panel>
-
-          <Panel title="Validation">
-            <div className="p-3">
-              {checks.map((c) => (
+          <Panel title="Deployability">
+            <div className="space-y-1.5 p-3 text-[12.5px]">
+              {(
+                [
+                  ["In sync", cert.drift.in_sync, "ok"],
+                  ["Drifted", cert.drift.drifted, "warn"],
+                  ["Missing", cert.drift.missing, "danger"],
+                  ["Unknown", cert.drift.unknown, "neutral"],
+                ] as const
+              ).map(([l, n, tone]) => (
                 <div
-                  key={c.label}
-                  className="flex items-center justify-between border-b border-border/60 py-1.5 last:border-0"
+                  key={l}
+                  className="flex items-center justify-between border-b border-border/60 pb-1.5 last:border-0"
                 >
-                  <span className="text-[12.5px] text-muted-foreground">{c.label}</span>
-                  <Pill tone={c.value === "Valid" ? "ok" : "danger"} dot>
-                    {c.value}
-                  </Pill>
+                  <span className="text-muted-foreground">{l}</span>
+                  <Pill tone={n > 0 ? tone : "neutral"}>{n}</Pill>
                 </div>
               ))}
+              <p className="pt-1 text-[11.5px] text-muted-foreground">
+                {deployable.length} of {active.length} installation{active.length === 1 ? "" : "s"}{" "}
+                eligible for automated deployment.
+              </p>
             </div>
           </Panel>
         </div>
       </div>
 
-      <div className="mt-3">
-        <Panel
-          title="Installed On"
-          actions={
-            <span className="text-[11.5px] text-muted-foreground">
-              Paths are configurable per deployment target
-            </span>
-          }
-        >
-          <DTable>
-            <THead>
-              <TH>Server</TH>
-              <TH>Hostname</TH>
-              <TH>Environment</TH>
-              <TH>Certificate Path</TH>
-              <TH>Key Path</TH>
-              <TH>Web Server</TH>
-              <TH>Current Status</TH>
-            </THead>
-            <tbody>
-              {cert.installations.map((i) => (
-                <TRow key={i.serverId}>
-                  <TD>
-                    <Link
-                      to="/servers/$id"
-                      params={{ id: i.serverId }}
-                      className="mono font-medium text-foreground hover:text-primary hover:underline"
-                    >
-                      {i.serverName}
-                    </Link>
-                  </TD>
-                  <TD className="mono">{i.ip}</TD>
-                  <TD>
-                    <EnvBadge env={i.environment} />
-                  </TD>
-                  <TD className="mono">{i.certPath}</TD>
-                  <TD className="mono">{i.keyPath}</TD>
-                  <TD className="text-muted-foreground">{i.webServer}</TD>
-                  <TD>
-                    <Pill
-                      tone={
-                        i.syncStatus === "Synced" ? "ok" : i.syncStatus === "Out of sync" ? "warn" : "neutral"
-                      }
-                      dot
-                    >
-                      {i.syncStatus}
-                    </Pill>
-                  </TD>
-                </TRow>
-              ))}
-            </tbody>
-          </DTable>
+      <div className="mt-3 space-y-3">
+        <Panel title="Installed On">
+          {cert.installations.length === 0 ? (
+            <EmptyState
+              title="Not installed anywhere"
+              hint="Discovery has not found this certificate on a server."
+            />
+          ) : (
+            <InstallationsTable rows={cert.installations} context="certificate" />
+          )}
+        </Panel>
+
+        <div className="grid gap-3 xl:grid-cols-2">
+          <Panel title="Versions">
+            {cert.versions.length === 0 ? (
+              <EmptyState
+                title="No uploaded versions"
+                hint="Use Upload / Replace to add a renewed certificate."
+              />
+            ) : (
+              <DTable>
+                <THead>
+                  <TH>Uploaded</TH>
+                  <TH>Fingerprint</TH>
+                  <TH>Expires</TH>
+                  <TH>Validation</TH>
+                  <TH>Key</TH>
+                </THead>
+                <tbody>
+                  {cert.versions.map((v) => (
+                    <TRow key={v.id}>
+                      <TD className="mono">{fmtAgo(v.created_at)}</TD>
+                      <TD className="mono">{shortFp(v.fingerprint_sha256)}</TD>
+                      <TD className="mono">{fmtDate(v.not_after)}</TD>
+                      <TD>
+                        <Pill
+                          tone={
+                            v.validation_status === "valid"
+                              ? "ok"
+                              : v.validation_status === "invalid"
+                                ? "danger"
+                                : "warn"
+                          }
+                        >
+                          {v.validation_status}
+                        </Pill>
+                      </TD>
+                      <TD className="text-muted-foreground">
+                        {v.reuses_existing_key ? "reuses existing" : "uploaded"}
+                      </TD>
+                    </TRow>
+                  ))}
+                </tbody>
+              </DTable>
+            )}
+          </Panel>
+
+          <Panel title="Deployment History">
+            {cert.deployments.length === 0 ? (
+              <EmptyState title="Never deployed from this tool" />
+            ) : (
+              <DTable>
+                <THead>
+                  <TH>Date</TH>
+                  <TH>Server</TH>
+                  <TH>Previous → New</TH>
+                  <TH>Status</TH>
+                </THead>
+                <tbody>
+                  {cert.deployments.map((d) => (
+                    <TRow key={d.target_id}>
+                      <TD>
+                        <Link
+                          to="/deployments/$id"
+                          params={{ id: d.id }}
+                          className="mono text-foreground hover:text-primary hover:underline"
+                        >
+                          {fmtDateTime(d.created_at)}
+                        </Link>
+                      </TD>
+                      <TD className="mono">
+                        {serverName.get(d.server_id) ?? d.server_id.slice(0, 8)}
+                      </TD>
+                      <TD className="mono text-muted-foreground">
+                        {shortFp(d.previous_fingerprint).slice(0, 8)} →{" "}
+                        {shortFp(d.new_fingerprint).slice(0, 8)}
+                      </TD>
+                      <TD>
+                        <JobStatusBadge status={d.target_status} />
+                      </TD>
+                    </TRow>
+                  ))}
+                </tbody>
+              </DTable>
+            )}
+          </Panel>
+        </div>
+
+        <Panel title="Backups">
+          {cert.backups.length === 0 ? (
+            <EmptyState
+              title="No backups"
+              hint="A verified backup of the replaced files is created before every deployment."
+            />
+          ) : (
+            <DTable>
+              <THead>
+                <TH>Created</TH>
+                <TH>Server</TH>
+                <TH>Verified</TH>
+                <TH>Restore</TH>
+                <TH>Retention until</TH>
+                {canRestore && <TH align="right">Action</TH>}
+              </THead>
+              <tbody>
+                {cert.backups.map((b) => (
+                  <TRow key={b.id}>
+                    <TD className="mono">{fmtDateTime(b.created_at)}</TD>
+                    <TD className="mono">
+                      {serverName.get(b.server_id) ?? b.server_id.slice(0, 8)}
+                    </TD>
+                    <TD>
+                      <Pill tone={b.verified ? "ok" : "danger"} dot>
+                        {b.verified ? "Verified" : "Unverified"}
+                      </Pill>
+                    </TD>
+                    <TD className="text-muted-foreground">
+                      {b.restore_status ?? "never restored"}
+                    </TD>
+                    <TD className="mono">{fmtDate(b.retention_until)}</TD>
+                    {canRestore && (
+                      <TD align="right">
+                        <button
+                          className={btnDangerCls}
+                          disabled={!b.verified}
+                          onClick={() => setRestoreId(b.id)}
+                        >
+                          <RotateCcw className="size-3.5" /> Restore
+                        </button>
+                      </TD>
+                    )}
+                  </TRow>
+                ))}
+              </tbody>
+            </DTable>
+          )}
         </Panel>
       </div>
+
+      {gate.dialog}
+      <ConfirmDialog
+        open={!!restoreId}
+        onOpenChange={(o) => {
+          if (!o) {
+            setRestoreId(null);
+            restore.reset();
+          }
+        }}
+        title="Restore this backup?"
+        description="The backed-up certificate files are written back to the server, the service configuration is tested and the service is reloaded. The certificate currently served will change."
+        confirmLabel="Restore backup"
+        destructive
+        pending={restore.isPending}
+        onConfirm={() => {
+          const bid = restoreId;
+          if (!bid) return;
+          void gate.attempt(
+            () =>
+              restore.mutateAsync(bid).then((r) => {
+                if (r.ok) toast.success("Backup restored");
+                else
+                  toast.error("Restore did not complete", {
+                    description: "Inspect the server manually.",
+                  });
+                setRestoreId(null);
+              }),
+            (e) => toast.error("Restore failed", { description: errorMessage(e) }),
+          );
+        }}
+      />
     </AppShell>
   );
 }

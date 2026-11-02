@@ -657,8 +657,11 @@ export function DeploymentLive({
           void gate.attempt(
             () =>
               act.rollback.mutateAsync({ id: job.id, targetId: t.id }).then((r) => {
-                if (r.ok) toast.success("Rolled back", { description: t.server_name ?? undefined });
-                else toast.error("Rollback needs manual attention");
+                if (r.accepted)
+                  toast.info("Rollback queued", {
+                    description: `${t.server_name ?? "Target"}: the status updates live when the worker finishes.`,
+                  });
+                else toast.error("Rollback was not accepted");
                 setRb(null);
               }),
             (e) => toast.error("Rollback failed", { description: errorMessage(e) }),

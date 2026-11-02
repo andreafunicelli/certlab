@@ -385,11 +385,11 @@ function CertificateDetail() {
           void gate.attempt(
             () =>
               restore.mutateAsync(bid).then((r) => {
-                if (r.ok) toast.success("Backup restored");
-                else
-                  toast.error("Restore did not complete", {
-                    description: "Inspect the server manually.",
+                if (r.accepted)
+                  toast.info("Restore queued", {
+                    description: "Follow the backup's restore status; it updates when the worker finishes.",
                   });
+                else toast.error("Restore was not accepted");
                 setRestoreId(null);
               }),
             (e) => toast.error("Restore failed", { description: errorMessage(e) }),

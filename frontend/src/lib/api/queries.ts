@@ -233,7 +233,7 @@ export const api = {
     cancel: (id: string) => post<DeploymentJob>(`/deployments/${id}/cancel`),
     retry: (id: string) => post<DeploymentJob>(`/deployments/${id}/retry`),
     rollback: (id: string, targetId: string) =>
-      post<{ ok: boolean; result: unknown }>(
+      post<RestoreQueued>(
         `/deployments/${id}/targets/${enc(targetId)}/rollback`,
       ),
     /** SSE endpoint URL for EventSource (same origin, cookie auth). */
@@ -243,7 +243,7 @@ export const api = {
     list: (q?: Query) => get<Page<Backup>>("/backups", q),
     get: (id: string) => get<Backup>(`/backups/${id}`),
     restore: (id: string) =>
-      post<{ ok: boolean; result: unknown; backup: Backup }>(`/backups/${id}/restore`),
+      post<RestoreQueued & { backup: Backup }>(`/backups/${id}/restore`),
   },
   discoveryJobs: {
     list: (q?: Query) => get<Page<DiscoveryJob>>("/discovery-jobs", q),
@@ -493,6 +493,13 @@ export const useCertificate = (id: string | null | undefined) =>
     queryKey: qk.certificates.detail(id ?? ""),
     queryFn: () => api.certificates.get(id as string),
     enabled: !!id,
+    // Restores run in a worker: poll while one is in progress so the status settles on screen.
+    refetchInterval: (q) =>
+      (q.state.data as { backups?: { restore_status?: string | null }[] } | undefined)?.backups?.some(
+        (b) => b.restore_status === "in_progress",
+      )
+        ? 3000
+        : false,
   });
 
 /** Everything that may change after inventory-affecting writes (verify, deploy, restore, discovery). */
@@ -599,6 +606,17 @@ export const useBackups = (params?: Query, enabled = true) =>
     queryFn: () => api.backups.list(params),
     enabled,
   });
+/** Restores and manual rollbacks are queued (HTTP 202) and run in a worker; follow
+ * backup.restore_status and the target status for the outcome. */
+export interface RestoreQueued {
+  accepted: boolean;
+  backup_id: string;
+  target_id: string | null;
+  job_id: string | null;
+  restore_status: string;
+  message: string;
+}
+
 export function useRestoreBackup() {
   const qc = useQueryClient();
   return useMutation({

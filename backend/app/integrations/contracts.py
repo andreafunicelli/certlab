@@ -6,9 +6,10 @@ Every layer imports from here; do not redefine these types elsewhere.
 from __future__ import annotations
 
 import enum
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Protocol, Sequence
+from typing import Protocol
 
 
 # --------------------------------------------------------------------------- certificates

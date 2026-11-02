@@ -22,6 +22,7 @@ dependencies = [
   "python-multipart>=0.0.9",
   "structlog>=24.1",
   "email-validator>=2.1",
+  "bcrypt>=4.0",
 ]
 
 [project.optional-dependencies]
@@ -42,3 +43,6 @@ markers = ["integration: requires the local disposable SSH/nginx/apache target (
 [tool.ruff]
 line-length = 110
 target-version = "py312"
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["app.api.deps.require_permission", "app.api.v1.credentials.body_parser", "fastapi.Depends", "fastapi.Query", "fastapi.Header", "fastapi.Body"]

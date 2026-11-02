@@ -63,7 +63,7 @@ function EnvDialog({ env, onClose }: { env: Environment | null; onClose: () => v
             Environments group servers and drive deployment approval rules.
           </DialogDescription>
         </DialogHeader>
-        <form onSubmit={submit} className="space-y-3">
+        <form method="post" onSubmit={submit} className="space-y-3">
           <div>
             <label className={labelCls} htmlFor="env-name">
               Name

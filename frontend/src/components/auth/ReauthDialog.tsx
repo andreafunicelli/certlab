@@ -64,7 +64,7 @@ export function ReauthDialog({
           <DialogTitle>Confirm your identity</DialogTitle>
           <DialogDescription>{reason}</DialogDescription>
         </DialogHeader>
-        <form onSubmit={submit} className="space-y-3">
+        <form method="post" onSubmit={submit} className="space-y-3">
           <div>
             <label className={labelCls} htmlFor="reauth-password">
               Password

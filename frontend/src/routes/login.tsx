@@ -1,7 +1,7 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { KeyRound, ShieldAlert } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "@/lib/api/queries";
 import { useLogin } from "@/lib/api/queries";
 import { isApiError } from "@/lib/api/client";
@@ -54,6 +54,10 @@ function LoginPage() {
   const navigate = useNavigate();
   const login = useLogin();
   const oidc = useOidcEnabled();
+  // Credentials must never be submitted by the browser itself (GET would put them in the URL):
+  // the form is POST-only and the button stays disabled until React has hydrated and owns submit.
+  const [hydrated, setHydrated] = useState(false);
+  useEffect(() => setHydrated(true), []);
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [totp, setTotp] = useState("");
@@ -91,7 +95,7 @@ function LoginPage() {
           <div className="panel-header">
             <h1 className="text-[12.5px] font-semibold tracking-tight">Sign in</h1>
           </div>
-          <form onSubmit={submit} className="space-y-3 p-3.5">
+          <form method="post" onSubmit={submit} className="space-y-3 p-3.5">
             <div>
               <label className={labelCls} htmlFor="username">
                 Username
@@ -149,7 +153,7 @@ function LoginPage() {
             <button
               type="submit"
               className={cn(btnPrimaryCls, "h-8 w-full justify-center")}
-              disabled={login.isPending}
+              disabled={!hydrated || login.isPending}
             >
               {login.isPending && <Spinner />} Sign in
             </button>

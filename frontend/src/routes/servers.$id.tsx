@@ -498,7 +498,7 @@ function EditServerDialog({ server, onClose }: { server: Server; onClose: () => 
             Changing the address or port may invalidate the enrolled host key.
           </DialogDescription>
         </DialogHeader>
-        <form onSubmit={submit} className="grid gap-3 sm:grid-cols-2">
+        <form method="post" onSubmit={submit} className="grid gap-3 sm:grid-cols-2">
           <Field label="Name" id="e-name">
             <input id="e-name" className={inputCls} value={f.name} onChange={set("name")} />
           </Field>

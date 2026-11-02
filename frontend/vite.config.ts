@@ -12,4 +12,12 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  // Self-hosted (Docker) build: plain Node server -> `node .output/server/index.mjs`.
+  nitro: { preset: "node-server" },
+  vite: {
+    server: {
+      // Dev: same-origin API access (cookies + CSRF work exactly like behind the production proxy).
+      proxy: { "/api": process.env["CDP_API_PROXY_TARGET"] ?? "http://127.0.0.1:8000" },
+    },
+  },
 });

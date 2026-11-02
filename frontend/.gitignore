@@ -30,3 +30,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# e2e artifacts
+e2e/shots/
+test-results/

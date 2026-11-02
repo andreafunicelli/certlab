@@ -1,4 +1,4 @@
-import { Link, useRouterState } from "@tanstack/react-router";
+import { Link, useNavigate, useRouterState } from "@tanstack/react-router";
 import {
   LayoutDashboard,
   ShieldCheck,
@@ -17,17 +17,15 @@ import {
 import { useState, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { useTheme } from "@/components/theme";
-import { currentUser } from "@/lib/mock-data";
+import { roleLabel, useSession, useUnauthorizedRedirect, isUnauthenticated } from "@/lib/auth";
+import { useLogout, useSettings } from "@/lib/api/queries";
+import { ErrorState, LoadingBlock } from "@/components/ui/feedback";
+import { useQuery } from "@tanstack/react-query";
+import { get } from "@/lib/api/client";
 import { Pill } from "@/components/ui/status";
 
 type NavPath =
-  | "/"
-  | "/certificates"
-  | "/servers"
-  | "/deployments"
-  | "/expirations"
-  | "/audit"
-  | "/settings";
+  "/" | "/certificates" | "/servers" | "/deployments" | "/expirations" | "/audit" | "/settings";
 
 const nav: {
   to: NavPath;
@@ -47,6 +45,16 @@ const nav: {
 function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const { theme, setTheme } = useTheme();
+  const { me } = useSession();
+  const logout = useLogout();
+  const navigate = useNavigate();
+  const name = me?.user.display_name || me?.user.username || "";
+  const initials = name
+    .split(/[\s._-]+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((p) => p[0]!.toUpperCase())
+    .join("");
 
   return (
     <div className="flex h-full flex-col bg-sidebar">
@@ -114,16 +122,20 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
 
         <div className="flex items-center gap-2.5 rounded-md px-1.5 py-1.5">
           <div className="flex size-7 shrink-0 items-center justify-center rounded-full bg-primary/15 text-[11px] font-semibold text-primary">
-            AF
+            {initials || "?"}
           </div>
           <div className="min-w-0 flex-1">
-            <div className="truncate text-[12.5px] font-medium text-sidebar-foreground">
-              {currentUser.name}
-            </div>
-            <div className="text-[10.5px] text-muted-foreground">{currentUser.role}</div>
+            <div className="truncate text-[12.5px] font-medium text-sidebar-foreground">{name}</div>
+            <div className="text-[10.5px] text-muted-foreground">{roleLabel(me?.roles ?? [])}</div>
           </div>
           <button
             title="Log out"
+            aria-label="Log out"
+            onClick={() =>
+              logout.mutate(undefined, {
+                onSettled: () => void navigate({ to: "/login", search: {} }),
+              })
+            }
             className="rounded-sm p-1.5 text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground"
           >
             <LogOut className="size-3.5" />
@@ -134,8 +146,42 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
   );
 }
 
+function HeaderStatus() {
+  const settings = useSettings();
+  const ready = useQuery({
+    queryKey: ["readyz"],
+    queryFn: () => get<{ status: string }>("/readyz"),
+    refetchInterval: 30_000,
+    retry: false,
+  });
+  const tz = settings.data?.general.data["timezone"];
+  return (
+    <>
+      <Pill tone={ready.isError ? "warn" : ready.data ? "ok" : "neutral"} dot>
+        {ready.isError ? "API degraded" : ready.data ? "API ready" : "API …"}
+      </Pill>
+      {typeof tz === "string" && <Pill tone="neutral">{tz}</Pill>}
+    </>
+  );
+}
+
 export function AppShell({ children }: { children: ReactNode }) {
   const [mobileOpen, setMobileOpen] = useState(false);
+  const { me, isLoading, error, refetch } = useSession();
+  useUnauthorizedRedirect();
+
+  // Session gate. SSR and the first client render show the same placeholder (no API call on the server).
+  if (!me) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background">
+        {isLoading || isUnauthenticated(error) || !error ? (
+          <LoadingBlock label="Checking session…" />
+        ) : (
+          <ErrorState error={error} onRetry={() => void refetch()} />
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-screen bg-background">
@@ -175,10 +221,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             />
           </div>
           <div className="ml-auto flex items-center gap-2">
-            <Pill tone="ok" dot>
-              Scheduler online
-            </Pill>
-            <Pill tone="neutral">Europe/Rome</Pill>
+            <HeaderStatus />
           </div>
         </header>
 

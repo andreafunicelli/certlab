@@ -78,7 +78,8 @@ export function SshBadge({ status }: { status: string }) {
 }
 
 export function DaysLeft({ days }: { days: number }) {
-  const tone: Tone = days < 0 ? "danger" : days <= 7 ? "crit" : days <= 30 ? "warn" : days <= 90 ? "info" : "ok";
+  const tone: Tone =
+    days < 0 ? "danger" : days <= 7 ? "crit" : days <= 30 ? "warn" : days <= 90 ? "info" : "ok";
   return (
     <span
       className={cn(
@@ -97,4 +98,39 @@ export function DaysLeft({ days }: { days: number }) {
 
 export function Mono({ children, className }: { children: ReactNode; className?: string }) {
   return <span className={cn("mono text-muted-foreground", className)}>{children}</span>;
+}
+
+const connTone: Record<string, { tone: Tone; label: string }> = {
+  connected: { tone: "ok", label: "Connected" },
+  unknown: { tone: "neutral", label: "Not tested" },
+  offline: { tone: "danger", label: "Offline" },
+  auth_error: { tone: "danger", label: "Auth failed" },
+  host_key_unknown: { tone: "warn", label: "Host key not enrolled" },
+  host_key_mismatch: { tone: "crit", label: "Host key changed" },
+  error: { tone: "danger", label: "Error" },
+};
+
+/** SSH connection status coming from the API (`connection_status`). */
+export function ConnectionBadge({ status, enabled = true }: { status: string; enabled?: boolean }) {
+  if (!enabled)
+    return (
+      <Pill tone="neutral" dot>
+        Disabled
+      </Pill>
+    );
+  const m = connTone[status] ?? { tone: "neutral" as Tone, label: status };
+  return (
+    <Pill tone={m.tone} dot>
+      {m.label}
+    </Pill>
+  );
+}
+
+export function OutcomePill({ outcome }: { outcome: string }) {
+  const tone: Tone = outcome === "success" ? "ok" : outcome === "denied" ? "warn" : "danger";
+  return (
+    <Pill tone={tone} dot>
+      {outcome.toUpperCase()}
+    </Pill>
+  );
 }

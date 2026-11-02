@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AuditRouteImport } from './routes/audit'
 import { Route as ExpirationsRouteImport } from './routes/expirations'
+import { Route as LoginRouteImport } from './routes/login'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as CertificatesIndexRouteImport } from './routes/certificates.index'
 import { Route as DeploymentsIndexRouteImport } from './routes/deployments.index'
@@ -35,6 +36,11 @@ const AuditRoute = AuditRouteImport.update({
 const ExpirationsRoute = ExpirationsRouteImport.update({
   id: '/expirations',
   path: '/expirations',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SettingsRoute = SettingsRouteImport.update({
@@ -87,6 +93,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/audit': typeof AuditRoute
   '/expirations': typeof ExpirationsRoute
+  '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
   '/deployments/$id': typeof DeploymentsIdRoute
   '/servers/$id': typeof ServersIdRoute
@@ -101,6 +108,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/audit': typeof AuditRoute
   '/expirations': typeof ExpirationsRoute
+  '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
   '/deployments/$id': typeof DeploymentsIdRoute
   '/servers/$id': typeof ServersIdRoute
@@ -116,6 +124,7 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/audit': typeof AuditRoute
   '/expirations': typeof ExpirationsRoute
+  '/login': typeof LoginRoute
   '/settings': typeof SettingsRoute
   '/deployments/$id': typeof DeploymentsIdRoute
   '/servers/$id': typeof ServersIdRoute
@@ -132,6 +141,7 @@ export interface FileRouteTypes {
     | '/'
     | '/audit'
     | '/expirations'
+    | '/login'
     | '/settings'
     | '/deployments/$id'
     | '/servers/$id'
@@ -146,6 +156,7 @@ export interface FileRouteTypes {
     | '/'
     | '/audit'
     | '/expirations'
+    | '/login'
     | '/settings'
     | '/deployments/$id'
     | '/servers/$id'
@@ -160,6 +171,7 @@ export interface FileRouteTypes {
     | '/'
     | '/audit'
     | '/expirations'
+    | '/login'
     | '/settings'
     | '/deployments/$id'
     | '/servers/$id'
@@ -175,6 +187,7 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AuditRoute: typeof AuditRoute
   ExpirationsRoute: typeof ExpirationsRoute
+  LoginRoute: typeof LoginRoute
   SettingsRoute: typeof SettingsRoute
   DeploymentsIdRoute: typeof DeploymentsIdRoute
   ServersIdRoute: typeof ServersIdRoute
@@ -207,6 +220,13 @@ declare module '@tanstack/react-router' {
       path: '/expirations'
       fullPath: '/expirations'
       preLoaderRoute: typeof ExpirationsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/settings': {
@@ -279,6 +299,7 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AuditRoute: AuditRoute,
   ExpirationsRoute: ExpirationsRoute,
+  LoginRoute: LoginRoute,
   SettingsRoute: SettingsRoute,
   DeploymentsIdRoute: DeploymentsIdRoute,
   ServersIdRoute: ServersIdRoute,

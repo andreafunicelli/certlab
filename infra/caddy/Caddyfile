@@ -1,7 +1,8 @@
 # Reverse proxy: the ONLY service published to the host.
-# Set CDP_DOMAIN to a real DNS name for automatic HTTPS (ACME), or keep "localhost"
-# for an internal CA certificate. To use your own certificate, replace `tls internal`
-# with `tls /certs/fullchain.pem /certs/privkey.pem` and mount them.
+# CDP_DOMAIN: public/internal DNS name of the console.
+# CDP_TLS_DIRECTIVE (compose env, default "tls internal" = Caddy private CA):
+#   ACME (public DNS + port 80/443 reachable): "tls admin@example.com"
+#   Own certificate: "tls /certs/fullchain.pem /certs/privkey.pem" and mount ./certs:/certs:ro
 {$CDP_DOMAIN:localhost} {
 	encode gzip
 	header {
@@ -22,5 +23,5 @@
 	handle {
 		reverse_proxy frontend:3000
 	}
-	{$CDP_TLS_DIRECTIVE:tls internal}
+	{$CDP_TLS_DIRECTIVE}
 }

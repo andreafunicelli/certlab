@@ -75,6 +75,9 @@ def login(db: Session, username: str, password: str, totp: str | None) -> tuple[
         secret = get_vault().decrypt_value(user.mfa_secret_encrypted or "")
         if not security.verify_totp(secret, totp):
             user.failed_login_count += 1
+            if user.failed_login_count >= MAX_FAILED:
+                user.locked_until = now + timedelta(minutes=LOCK_MINUTES)
+                user.failed_login_count = 0
             raise _fail(db, username, user, "bad_totp")
     if security.needs_rehash(user.password_hash or ""):
         user.password_hash = security.hash_password(password)

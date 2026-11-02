@@ -108,6 +108,9 @@ services:
       - "${CDP_HTTPS_PORT:-443}:443"
     environment:
       CDP_DOMAIN: ${CDP_DOMAIN:-localhost}
+      # "tls internal" (private CA) by default; set to e.g. "tls admin@example.com" for ACME,
+      # or "tls /certs/fullchain.pem /certs/privkey.pem" with a mounted volume.
+      CDP_TLS_DIRECTIVE: ${CDP_TLS_DIRECTIVE:-tls internal}
     volumes:
       - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddydata:/data

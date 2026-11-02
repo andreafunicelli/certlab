@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install the Cert Deploy Pro remote helper on a target host (run as root).
-# Usage: install.sh [--user cdpdeploy] [--pubkey-file FILE] [--allowed-roots "..."] [--conf-only]
+# Usage: install.sh [--user cdpdeploy] [--pubkey-file FILE] [--allowed-roots "..."]
 set -eu
 SRC=$(cd "$(dirname "$0")" && pwd)
 USER_NAME=cdpdeploy

@@ -116,5 +116,94 @@ Every response carries `X-Correlation-ID`.
 | F docs | subagent | docs/*.md |
 | Integration/acceptance + security review | lead | end-to-end scenario against disposable target |
 
-## 5. Progress log
-(updated as streams land — see bottom of file)
+## 5. Status (2026-11-02)
+
+### 5.1 Acceptance scenario (section 22 of the brief)
+
+Executed against the **local disposable target**: Ubuntu 24.04, sshd :2222, nginx :8443, apache :9443, haproxy :10443,
+on a private test CA. No production system was touched.
+
+| # | Criterion | Result | Evidence |
+|---|---|---|---|
+| 1 | Admin logs in | Pass | Playwright `e2e/smoke.spec.ts` |
+| 2 | Register real Linux server | Pass | `smoke.spec.ts`, `deploy.spec.ts` |
+| 3 | Verified SSH connection (host-key confirm + enroll) | Pass | 7-step connection test in UI; integration tests for unknown/mismatched keys |
+| 4 | Detect nginx / apache | Pass | probe + `test_discovery_live.py` |
+| 5 | Discover existing certificate | Pass | discovery job (Celery) via UI |
+| 6 | Metadata, expiry, path, service shown | Pass | certificate detail screenshots |
+| 7 | Upload replacement | Pass | renew wizard step 1 |
+| 8 | Cryptographic validation and compatibility | Pass | findings (blocking/warning/info) |
+| 9 | Select target installation | Pass | wizard step 3 |
+| 10 | Truthful dry run | Pass | `test_deploy_live` (i): remote files byte-identical, no staging dirs |
+| 11 | Approve deployment | Pass | approval path in unit/integration tests. Approval of a Production deployment was **not** exercised in the browser. |
+| 12 | Backup files + metadata | Pass | verified encrypted backup per target |
+| 13 | Stage + activate safely | Pass | stage → validate → atomic rename |
+| 14 | Config validation | Pass | `nginx -t` / `apachectl configtest` / `haproxy -c` |
+| 15 | Graceful reload | Pass | non-systemd fallback only (container has no systemd) |
+| 16 | TLS verification of new fingerprint | Pass | engine probe **and** independent `openssl s_client` in e2e |
+| 17 | Shown as successful | Pass | deployment detail |
+| 18 | Complete audit record | Pass | DEPLOYMENT_CREATED/STARTED/STATE/TARGET_STATE/FINISHED rows |
+| 19 | Previous cert available as backup | Pass | backups API; DR verification decrypts all backups |
+| 20 | Failed deployment → verified rollback | Pass | live API run: verify endpoint sabotaged → `VERIFY_FINGERPRINT_MISMATCH` → rolled back, files byte-identical, original cert served. Also integration scenarios (e), (f), (g), (l). |
+| 21 | Worker/browser restart keeps history | Pass | API + worker + beat restarted, all jobs/backups present; crash-resume tests (k, k2) |
+| 22 | Critical tests pass | Pass | see 5.2 |
+
+### 5.2 Test results (actual, final run)
+
+| Suite | Result |
+|---|---|
+| Backend: unit + live integration (`cd backend && .venv/bin/pytest -q`) | **441 passed, 1 skipped** (stale scaffold test, since removed), 252 s |
+| Backend lint (`ruff check .`) | clean |
+| Migrations | single head `0004`; `alembic check` reported no drift at 0001 |
+| Frontend typecheck / production build | clean / succeeds (node-server output) |
+| Playwright live e2e (`frontend/e2e`) | **2/2 passed** against live API + worker + SSH target, re-run after the dependency upgrade |
+| Disaster-recovery restore test | pass; see `docs/backup-restore.md` (wrong KEK → nothing decrypts) |
+| `pip-audit` | no known vulnerabilities |
+| `bun audit` | 1 high (zod 3, used client-side only), 1 moderate (minimatch, build tooling). 4 critical, including the TanStack Start reflected XSS, were fixed by upgrading. |
+| Docker Compose | `docker compose config` valid; **images never built or run here** because Docker Hub is blocked by the network policy |
+
+### 5.3 Completed functionality
+
+Server registry with credential profiles (encrypted keys, passphrases), strict host-key enrollment, bastion, connection
+tests; restricted remote helper + single-line sudoers policy; nginx/apache/haproxy config discovery + bounded filesystem
+scan with classification, confidence, idempotent inventory, drift/missing detection; certificate upload (PEM, chain,
+PKCS#12) with validation; dry-run planner; durable per-target deployment state machine with locks, verified encrypted
+backups, staging, atomic activation, config test, graceful reload, live TLS verification, automatic verified rollback,
+crash reconciliation, canary/batch strategy, approvals, idempotency; backups API (restore/download); expiry & drift
+monitoring; SMTP + signed webhook notifications with dedupe; local auth + TOTP + OIDC, RBAC, re-auth, CSRF, rate
+limits, audit trail; settings with optimistic concurrency; SSE live progress; the existing Lovable UI wired to all of it
+(mock data retained only under `frontend/src/lib/demo`, unused); Docker Compose stack; 12 docs.
+
+### 5.4 Known limitations / remaining work
+
+- **Not exercised here**: systemd reload path; RHEL-family targets (code paths exist; only Ubuntu 24.04 ran live);
+  SELinux contexts; OIDC against a real IdP; SMTP against a real server; Compose images; ACME TLS on the proxy.
+- Engine replaces **existing** files only (no first-time install of a new path, no file deletion).
+- Certbot-managed paths are detected and **blocked by design** (use certbot deploy hooks).
+- HAProxy combined PEMs are not readable by the helper (key inside), so their discovery fingerprint comes from the live endpoint.
+- JKS/PKCS#12 keystores on targets, Tomcat, Postfix, Docker-mounted certificates: **unsupported** (plugin interface only).
+- Bastion reuses the target's credential.
+- Cancellation after activation starts is intentionally not honoured (would leave a half-applied state); API says so.
+- Remaining known-issue register: `docs/deployment-engine.md` (K-table, each item marked Fixed/Kept with reason).
+- Frontend: approval-required and viewer/operator RBAC flows are covered by backend tests only, not by browser tests.
+- Each e2e run registers a new server; servers with deployment history can't be deleted (by design), so dev DBs accumulate.
+
+### 5.5 Security review summary
+
+Fixed during review: TOTP brute-force lockout gap; `CDP_TLS_DIRECTIVE` not wired (proxy always internal CA); critical
+TanStack Start XSS dependency; false-negative SAN blocking from composite vhost labels; restore/rollback moved out of
+HTTP requests; per-environment trusted-chain enforcement (on for Production by migration).
+Verified by inspection: no shell interpolation (helper takes argv only; every arg quoted; paths canonicalised and
+allow-listed server-side), no `shell=True`/`eval`/pickle in backend, host-key checking never disabled, TLS probe
+intentionally retrieves without trust then verifies separately, secrets redacted from logs, private keys never in
+API responses, KEK never in Postgres, Postgres/Redis not published.
+Open: zod 3 advisory (client-side only); the helper runs as root through sudo, so a compromised worker with SSH
+credentials can overwrite any file under `ALLOWED_ROOTS` on enrolled hosts (narrow roots per host; threat model in `docs/security.md`).
+No independent penetration test has been done.
+
+### 5.6 Operational readiness
+
+**Not production-ready yet.** Functionally complete and verified end to end against a disposable target, but before
+production use: build and run the Compose stack on the target VM; run the integration suite against a disposable RHEL/Rocky
+target with systemd; test OIDC/SMTP with real providers; narrow `ALLOWED_ROOTS` per host; external security review.
+Pilot on staging servers first; production deployments default to requiring approval.

@@ -172,19 +172,6 @@ def test_environment_in_use_cannot_be_deleted(admin):
     assert r.status_code == 409 and r.json()["error"]["code"] == "ENVIRONMENT_IN_USE"
 
 
-def test_discover_returns_501_when_stream_missing(admin):
-    sid = admin.post("/api/v1/servers", json=_server()).json()["id"]
-    if "app.services.discovery" in sys.modules:
-        pytest.skip("discovery service implemented")
-    try:
-        import app.services.discovery  # noqa: F401
-        pytest.skip("discovery service implemented")
-    except ImportError:
-        pass
-    r = admin.post(f"/api/v1/servers/{sid}/discover")
-    assert r.status_code == 501 and r.json()["error"]["code"] == "NOT_IMPLEMENTED"
-
-
 def _fake_ssh(monkeypatch, fp="SHA256:abc", key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5FAKE"):
     mod = types.ModuleType("app.integrations.ssh")
 

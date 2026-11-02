@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import require_permission
 from app.core.db import get_db
-from app.core.errors import AppError
 from app.schemas.common import Page, PageParams
 from app.schemas.server import (
     EnvironmentCreate,
@@ -110,10 +109,8 @@ def _job_dict(job: Any) -> Any:
 def discover(server_id: uuid.UUID, ctx: AuthContext = Depends(require_permission("discovery:run")),
              db: Session = Depends(get_db)):
     service.get(db, server_id)
-    try:
-        from app.services.discovery import start_discovery
-    except ImportError as exc:
-        raise AppError("NOT_IMPLEMENTED", "Discovery is not available in this build", 501) from exc
+    from app.services.discovery import start_discovery
+
     return _job_dict(start_discovery(db, ctx.user, server_id))
 
 

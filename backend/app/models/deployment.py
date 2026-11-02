@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import ForeignKey, Integer, String, Text, func
+from sqlalchemy import ForeignKey, Index, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -29,7 +29,11 @@ class DiscoveryJob(IdMixin, TimestampMixin, Base):
     stats: Mapped[dict[str, Any] | None]
     error: Mapped[str | None] = mapped_column(Text)
 
-    __table_args__ = (in_check("status", DISCOVERY_STATUSES, "status"),)
+    __table_args__ = (
+        in_check("status", DISCOVERY_STATUSES, "status"),
+        Index("uq_discovery_jobs_active_per_server", "server_id", unique=True,
+              postgresql_where=text("status IN ('pending', 'running')")),
+    )
 
 
 class DiscoveryFinding(IdMixin, Base):
@@ -59,6 +63,8 @@ class DeploymentJob(IdMixin, TimestampMixin, Base):
     error_summary: Mapped[str | None] = mapped_column(Text)
     cancel_requested: Mapped[bool] = mapped_column(default=False, server_default="false")
     acknowledged_warnings: Mapped[list[Any]] = mapped_column(JSONB, server_default="[]", default=list)
+    request_hash: Mapped[str | None] = mapped_column(String(64))   # idempotency: sha256 of the canonical request body
+    retry_of: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("deployment_jobs.id", ondelete="SET NULL"))
 
     __table_args__ = (in_check("status", DEPLOYMENT_STATUSES, "status"),)
 
@@ -85,6 +91,8 @@ class DeploymentTarget(IdMixin, TimestampMixin, Base):
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
     log: Mapped[list[dict[str, Any]]] = mapped_column(server_default="[]", default=list)
+    # engine working state (stage dir, shared-path group, expected hashes, baseline served fingerprint ...)
+    meta: Mapped[dict[str, Any]] = mapped_column(server_default="{}", default=dict)
 
     __table_args__ = (in_check("status", TARGET_STATUSES, "status"),)
 

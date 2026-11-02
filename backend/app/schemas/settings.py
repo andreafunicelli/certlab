@@ -47,6 +47,26 @@ class SecuritySettings(_Section):
     session_minutes: int = Field(480, ge=5, le=43200)
     require_production_approval: bool = True
     reauth_minutes: int = Field(10, ge=1, le=240)
+    # single-admin installs may enable this so the initiator can approve their own production deployment
+    allow_self_approval: bool = False
+    # optional extra trust anchors (PEM, public certificates only) used when validating uploads and probing endpoints
+    trust_anchors_pem: str = Field("", max_length=200_000)
+
+    @field_validator("trust_anchors_pem")
+    @classmethod
+    def _anchors(cls, v: str) -> str:
+        if not v.strip():
+            return ""
+        if "PRIVATE KEY" in v:
+            raise ValueError("trust anchors must not contain private keys")
+        from app.integrations.certificates import parse_pem_certificates
+
+        try:
+            if not parse_pem_certificates(v.encode()):
+                raise ValueError("no certificates found")
+        except Exception as exc:
+            raise ValueError("trust_anchors_pem must contain valid PEM certificates") from exc
+        return v
 
 
 class SSHSettings(_Section):

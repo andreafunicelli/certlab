@@ -17,6 +17,7 @@ _VIEWER = frozenset({
 _OPERATOR = _VIEWER | frozenset({
     "servers:test", "discovery:run", "certificates:verify", "installations:verify", "versions:upload",
     "deployments:plan", "deployments:create", "deployments:cancel", "deployments:retry",
+    "installations:write",
 })
 
 # admin gets everything ("*"); the explicit list documents the full set of known permissions.
@@ -25,7 +26,6 @@ ALL_PERMISSIONS = frozenset(_OPERATOR | {
     "credentials:read", "credentials:write",
     "servers:write", "servers:hostkey",
     "environments:write", "settings:write",
-    "installations:write",
     "deployments:approve", "deployments:rollback",
     "backups:restore", "backups:download",
     "notifications:read", "notifications:write",

@@ -11,3 +11,4 @@ backend/var/
 frontend/test-results/
 frontend/playwright-report/
 secrets/
+dump.rdb

@@ -3,10 +3,10 @@ from __future__ import annotations
 import os
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import create_engine, pool
 
 import app.models  # noqa: F401  (register all tables)
+from alembic import context
 from app.models.base import Base
 
 config = context.config

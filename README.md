@@ -20,6 +20,22 @@ Celery worker and beat, PostgreSQL, Redis, a Caddy proxy and a TanStack Start fr
 - Local accounts with RBAC (admin, operator, viewer), OIDC (PKCE), optional TOTP and re-authentication for sensitive actions.
 - Audit trail, and envelope encryption: each artifact has its own AES-256-GCM data key, wrapped by a master key that never reaches the database.
 
+## Screenshots
+
+These were captured from a development install. The data is real, not mock: two servers registered over SSH against
+the local disposable test target (`infra/test-target/`), then real discovery, one successful renewal, and one
+deliberately broken deployment that rolled back automatically.
+
+| | |
+|---|---|
+| **Dashboard**<br>![Dashboard](docs/screenshots/dashboard.png) | **Dashboard (light theme)**<br>![Dashboard, light theme](docs/screenshots/dashboard-light.png) |
+| **Certificate inventory**<br>![Certificates](docs/screenshots/certificates.png) | **Certificate detail: installations, versions, backups**<br>![Certificate detail](docs/screenshots/certificate-detail.png) |
+| **Servers**<br>![Servers](docs/screenshots/servers.png) | **Server detail: discovered installations**<br>![Server detail](docs/screenshots/server-detail.png) |
+| **Renewal wizard: validation findings**<br>![Wizard validation](docs/screenshots/wizard-validation.png) | **Renewal wizard: read-only dry-run plan**<br>![Wizard dry-run plan](docs/screenshots/wizard-dry-run-plan.png) |
+| **Deployment: completed and verified over TLS**<br>![Completed deployment](docs/screenshots/deployment-completed.png) | **Deployment: verification failed, automatic rollback**<br>![Rolled-back deployment](docs/screenshots/deployment-rolled-back.png) |
+| **Deployment history**<br>![Deployments](docs/screenshots/deployments.png) | **Expirations: calendar view**<br>![Expirations calendar](docs/screenshots/expirations-calendar.png) |
+| **Expirations: table view**<br>![Expirations](docs/screenshots/expirations.png) | **Audit log**<br>![Audit log](docs/screenshots/audit-log.png) |
+
 ## Support matrix
 
 | Target | Discovery | Deploy and rollback | Status |

@@ -52,6 +52,7 @@ function CreateUserDialog({ onClose }: { onClose: () => void }) {
           <DialogDescription>Password must be at least 12 characters.</DialogDescription>
         </DialogHeader>
         <form
+          method="post"
           className="space-y-3"
           onSubmit={(e) => {
             e.preventDefault();

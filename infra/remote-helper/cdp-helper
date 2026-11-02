@@ -1,0 +1,679 @@
+#!/bin/sh
+# cdp-helper - privileged helper for Cert Deploy Pro.
+# Fixed subcommands only, no eval, every path canonicalised and checked against ALLOWED_ROOTS.
+# Output: single-line JSON (exceptions: `dump *` emits raw config text; `write-staged` reads stdin).
+# Errors: JSON on stderr {"ok":false,"error":CODE,"message":...} and a meaningful exit status:
+#   2 BAD_ARGUMENT  3 PATH_NOT_ALLOWED  4 PERMISSION_DENIED  5 PRIVATE_KEY_REFUSED  6 DISK_FULL
+#   7 SYMLINK_DEST  8 SERVICE_NOT_INSTALLED  9 COMMAND_FAILED  10 BAD_CONFIG  11 TOO_LARGE
+#   12 NOT_FOUND  13 NOT_RUNNING
+set -eu
+umask 077
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+
+HELPER_VERSION="1.0.0"
+CONF=/etc/cdp-helper.conf
+
+ALLOWED_ROOTS="/etc/ssl /etc/pki /etc/nginx /etc/apache2 /etc/httpd /etc/letsencrypt /etc/haproxy /opt /usr/local/etc"
+STAGING_ROOT=/var/lib/cdp-helper/staging
+HAPROXY_CFG=/etc/haproxy/haproxy.cfg
+HAPROXY_PIDFILE=/run/haproxy.pid
+NGINX_BIN=""
+APACHE_CTL=""
+APACHE_BIN=""
+HAPROXY_BIN=""
+MAX_STAGED_BYTES=10485760
+MAX_OUTPUT_BYTES=16384
+
+# ----------------------------------------------------------------------------- json helpers
+# jesc STRING -> escaped string body (no surrounding quotes), newlines become \n
+jesc() {
+    printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037' |
+        sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$(printf '\t')/\\\\t/g" -e "s/$(printf '\r')/\\\\r/g" |
+        awk 'NR>1{printf "\\n"} {printf "%s",$0}'
+}
+js() { printf '"%s"' "$(jesc "$1")"; }
+# jn VALUE -> number or null
+jn() {
+    case "$1" in
+        '' | *[!0-9]*) printf 'null' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+jstr_or_null() { if [ -n "$1" ]; then js "$1"; else printf 'null'; fi; }
+
+fail() { # fail EXIT CODE MESSAGE
+    printf '{"ok":false,"error":%s,"message":%s}\n' "$(js "$2")" "$(js "$3")" >&2
+    exit "$1"
+}
+
+# ----------------------------------------------------------------------------- config
+load_conf() {
+    if [ -e "$CONF" ]; then
+        # must be a regular file, owned by root, not writable by group/other
+        [ -f "$CONF" ] && [ ! -L "$CONF" ] || fail 10 BAD_CONFIG "$CONF must be a regular file"
+        cu=$(stat -c '%u' -- "$CONF")
+        cm=$(stat -c '%a' -- "$CONF")
+        [ "$cu" = "0" ] || fail 10 BAD_CONFIG "$CONF must be owned by root"
+        case "$cm" in
+            644 | 640 | 600 | 444 | 400 | 440) : ;;
+            *) fail 10 BAD_CONFIG "$CONF must have mode 0644 (found $cm)" ;;
+        esac
+        # shellcheck disable=SC1090
+        . "$CONF"
+    fi
+    case "$STAGING_ROOT" in /*) : ;; *) fail 10 BAD_CONFIG "STAGING_ROOT must be absolute" ;; esac
+}
+
+# ----------------------------------------------------------------------------- path handling
+# check_arg_path PATH : syntactic validation (absolute, no newline/control chars)
+check_arg_path() {
+    case "$1" in
+        /*) : ;;
+        *) fail 2 BAD_ARGUMENT "path must be absolute" ;;
+    esac
+    case "$1" in
+        *"
+"*) fail 2 BAD_ARGUMENT "path must not contain newlines" ;;
+    esac
+    if printf '%s' "$1" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+        fail 2 BAD_ARGUMENT "path must not contain control characters"
+    fi
+    # reject '..' components outright
+    case "/$1/" in
+        */../*) fail 3 PATH_NOT_ALLOWED "path must not contain '..' components" ;;
+    esac
+}
+
+# canon PATH -> canonical path (symlinks resolved, nonexistent tail tolerated)
+canon() { realpath -m -- "$1"; }
+
+# under_root CANON ROOT
+under_root() {
+    case "$1" in
+        "$2" | "$2"/*) return 0 ;;
+    esac
+    return 1
+}
+
+# is_allowed CANON
+is_allowed() {
+    set -f
+    for r in $ALLOWED_ROOTS; do
+        rc=$(canon "$r")
+        [ "$rc" = "/" ] && continue
+        if under_root "$1" "$rc"; then
+            set +f
+            return 0
+        fi
+    done
+    set +f
+    return 1
+}
+
+# resolve_allowed PATH -> sets CP (canonical path), exits 3 if not allowed
+resolve_allowed() {
+    check_arg_path "$1"
+    CP=$(canon "$1")
+    is_allowed "$CP" || fail 3 PATH_NOT_ALLOWED "path is outside the allowed roots"
+}
+
+# resolve_staging DIR -> sets SD; DIR must be a direct child of STAGING_ROOT
+resolve_staging() {
+    check_arg_path "$1"
+    [ ! -L "$1" ] || fail 3 PATH_NOT_ALLOWED "stage dir must not be a symlink"
+    SD=$(canon "$1")
+    sroot=$(canon "$STAGING_ROOT")
+    [ "$(dirname -- "$SD")" = "$sroot" ] || fail 3 PATH_NOT_ALLOWED "stage dir is not under the staging root"
+    [ -d "$SD" ] || fail 12 NOT_FOUND "stage dir does not exist"
+}
+
+valid_name() { # [A-Za-z0-9._-]+ , not . or ..
+    case "$1" in
+        '' | . | .. | *[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    return 0
+}
+valid_mode() {
+    case "$1" in
+        [0-7][0-7][0-7] | [0-7][0-7][0-7][0-7]) return 0 ;;
+    esac
+    return 1
+}
+valid_uint() {
+    case "$1" in '' | *[!0-9]*) return 1 ;; esac
+    return 0
+}
+
+# ----------------------------------------------------------------------------- stat json
+# stat_json PATH (already validated) -> prints JSON object (no trailing newline)
+stat_json() {
+    sp=$1
+    if [ ! -e "$sp" ] && [ ! -L "$sp" ]; then
+        printf '{"path":%s,"exists":false,"file_type":null,"realpath":null,"symlink_target":null,"broken_symlink":false,"mode":null,"uid":null,"gid":null,"owner":null,"group":null,"size":null,"sha256":null,"selinux_context":null,"readable":false}' "$(js "$sp")"
+        return 0
+    fi
+    st_link=""
+    st_broken=false
+    if [ -L "$sp" ]; then
+        st_link=$(readlink -- "$sp" || true)
+        if [ ! -e "$sp" ]; then st_broken=true; fi
+    fi
+    if [ "$st_broken" = true ]; then
+        printf '{"path":%s,"exists":true,"file_type":"symlink","realpath":%s,"symlink_target":%s,"broken_symlink":true,"mode":null,"uid":null,"gid":null,"owner":null,"group":null,"size":null,"sha256":null,"selinux_context":null,"readable":false}' \
+            "$(js "$sp")" "$(js "$(canon "$sp")")" "$(js "$st_link")"
+        return 0
+    fi
+    st_real=$(realpath -- "$sp" 2>/dev/null || canon "$sp")
+    st_line=$(stat -L -c '%a|%u|%g|%U|%G|%s' -- "$sp")
+    st_mode=${st_line%%|*}; st_rest=${st_line#*|}
+    st_uid=${st_rest%%|*}; st_rest=${st_rest#*|}
+    st_gid=${st_rest%%|*}; st_rest=${st_rest#*|}
+    st_owner=${st_rest%%|*}; st_rest=${st_rest#*|}
+    st_group=${st_rest%%|*}; st_size=${st_rest#*|}
+    if [ -L "$sp" ]; then st_type=symlink
+    elif [ -f "$sp" ]; then st_type=file
+    elif [ -d "$sp" ]; then st_type=dir
+    else st_type=other; fi
+    st_sha=""
+    if [ -f "$sp" ] && [ -r "$sp" ]; then
+        st_sha=$(sha256sum -- "$sp" | cut -d' ' -f1)
+    fi
+    st_ctx=$(stat -L -c '%C' -- "$sp" 2>/dev/null || true)
+    case "$st_ctx" in '?' | '' | '(null)') st_ctx="" ;; esac
+    st_read=false
+    if [ -r "$sp" ]; then st_read=true; fi
+    # mode as octal NUMBER interpreted by the client (kept as decimal for JSON validity)
+    st_mode_dec=$(printf '%d' "0$st_mode")
+    printf '{"path":%s,"exists":true,"file_type":%s,"realpath":%s,"symlink_target":%s,"broken_symlink":false,"mode":%s,"uid":%s,"gid":%s,"owner":%s,"group":%s,"size":%s,"sha256":%s,"selinux_context":%s,"readable":%s}' \
+        "$(js "$sp")" "$(js "$st_type")" "$(js "$st_real")" "$(jstr_or_null "$st_link")" "$st_mode_dec" "$(jn "$st_uid")" "$(jn "$st_gid")" \
+        "$(js "$st_owner")" "$(js "$st_group")" "$(jn "$st_size")" "$(jstr_or_null "$st_sha")" "$(jstr_or_null "$st_ctx")" "$st_read"
+}
+
+b64() { base64 | tr -d '\n'; }
+
+# ----------------------------------------------------------------------------- service helpers
+find_bin() { # find_bin OVERRIDE name...
+    ov=$1; shift
+    if [ -n "$ov" ]; then
+        if [ -x "$ov" ]; then printf '%s' "$ov"; fi
+        return 0
+    fi
+    for n in "$@"; do
+        p=$(command -v "$n" 2>/dev/null || true)
+        if [ -n "$p" ]; then printf '%s' "$p"; return 0; fi
+    done
+    return 0
+}
+nginx_bin() { b=$(find_bin "$NGINX_BIN" nginx); [ -n "$b" ] || fail 8 SERVICE_NOT_INSTALLED "nginx is not installed"; printf '%s' "$b"; }
+apache_ctl() {
+    b=$(find_bin "$APACHE_CTL" apachectl apache2ctl)
+    if [ -z "$b" ]; then
+        b=$(find_bin "$APACHE_BIN" apache2 httpd)
+    fi
+    [ -n "$b" ] || fail 8 SERVICE_NOT_INSTALLED "apache is not installed"
+    printf '%s' "$b"
+}
+apache_bin() { find_bin "$APACHE_BIN" apache2 httpd; }
+haproxy_bin() { b=$(find_bin "$HAPROXY_BIN" haproxy); [ -n "$b" ] || fail 8 SERVICE_NOT_INSTALLED "haproxy is not installed"; printf '%s' "$b"; }
+
+use_systemd() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
+unit_exists() { # unit_exists NAME
+    systemctl list-unit-files "$1.service" 2>/dev/null | grep -q "^$1\.service"
+}
+service_manager() {
+    if use_systemd; then printf 'systemd'
+    elif command -v service >/dev/null 2>&1 || [ -d /etc/init.d ]; then printf 'sysv'
+    else printf 'none'; fi
+}
+is_running() { # is_running proc...
+    for n in "$@"; do
+        if pidof "$n" >/dev/null 2>&1; then return 0; fi
+    done
+    return 1
+}
+apache_unit() { if unit_exists apache2; then printf apache2; elif unit_exists httpd; then printf httpd; fi; }
+
+trim_out() { # limit command output
+    head -c "$MAX_OUTPUT_BYTES"
+}
+
+# capture CMD... -> sets CAP_OUT, CAP_RC
+capture() {
+    capf=$(mktemp)
+    CAP_RC=0
+    "$@" >"$capf" 2>&1 </dev/null || CAP_RC=$?
+    CAP_OUT=$(head -c "$MAX_OUTPUT_BYTES" "$capf")
+    rm -f -- "$capf"
+}
+
+emit_result() { # emit_result SERVICE ACTION   (uses CAP_OUT/CAP_RC)
+    ok=false
+    [ "$CAP_RC" -eq 0 ] && ok=true
+    printf '{"ok":%s,"service":%s,"action":%s,"exit":%s,"output":%s}\n' "$ok" "$(js "$1")" "$(js "$2")" "$CAP_RC" "$(js "$CAP_OUT")"
+    [ "$CAP_RC" -eq 0 ] || exit 9
+    exit 0
+}
+
+# ----------------------------------------------------------------------------- subcommands
+cmd_version() {
+    printf '{"name":"cdp-helper","version":%s}\n' "$(js "$HELPER_VERSION")"
+}
+
+svc_json() { # svc_json NAME BINARY VERSION RUNNING
+    sj_inst=false
+    [ -n "$2" ] && sj_inst=true
+    sj_run=null
+    if [ -n "$2" ]; then sj_run=$4; fi
+    printf '{"name":%s,"installed":%s,"binary":%s,"version":%s,"running":%s}' "$(js "$1")" "$sj_inst" "$(jstr_or_null "$2")" "$(jstr_or_null "$3")" "$sj_run"
+}
+bool_running() { if is_running "$@"; then printf true; else printf false; fi; }
+
+cmd_probe() {
+    os_id=""; os_ver=""; os_pretty=""; os_like=""
+    if [ -r /etc/os-release ]; then
+        # os-release is a documented sh-sourceable file; read it in a subshell
+        osl=$( . /etc/os-release; printf '%s|%s|%s|%s' "${ID:-}" "${VERSION_ID:-}" "${PRETTY_NAME:-}" "${ID_LIKE:-}" ) || osl="|||"
+        os_id=${osl%%|*}; osl=${osl#*|}
+        os_ver=${osl%%|*}; osl=${osl#*|}
+        os_pretty=${osl%%|*}; os_like=${osl#*|}
+    fi
+    kern=$(uname -r)
+    nb=$(find_bin "$NGINX_BIN" nginx)
+    nv=""
+    if [ -n "$nb" ]; then nv=$("$nb" -v 2>&1 | sed -n 's|.*nginx/\([^ ]*\).*|\1|p' | head -n1 || true); fi
+    ab=$(apache_bin)
+    ac=$(find_bin "$APACHE_CTL" apachectl apache2ctl)
+    av=""
+    if [ -n "$ab" ]; then av=$("$ab" -v 2>&1 | sed -n 's|.*Apache/\([^ ]*\).*|\1|p' | head -n1 || true); fi
+    hb=$(find_bin "$HAPROXY_BIN" haproxy)
+    hv=""
+    if [ -n "$hb" ]; then hv=$("$hb" -v 2>&1 | sed -n 's|^.*[Vv]ersion \([^ ]*\).*|\1|p' | head -n1 || true); fi
+    abin=${ab:-$ac}
+    printf '{"ok":true,"helper_version":%s,"os_id":%s,"os_version":%s,"os_pretty":%s,"os_id_like":%s,"kernel":%s,"service_manager":%s,"services":[%s,%s,%s]}\n' \
+        "$(js "$HELPER_VERSION")" "$(js "$os_id")" "$(js "$os_ver")" "$(js "$os_pretty")" "$(js "$os_like")" "$(js "$kern")" "$(js "$(service_manager)")" \
+        "$(svc_json nginx "$nb" "$nv" "$(bool_running nginx)")" \
+        "$(svc_json apache "$abin" "$av" "$(bool_running apache2 httpd)")" \
+        "$(svc_json haproxy "$hb" "$hv" "$(bool_running haproxy)")"
+}
+
+cmd_stat() {
+    [ $# -eq 1 ] || fail 2 BAD_ARGUMENT "usage: stat PATH"
+    resolve_allowed "$1"
+    stat_json "$1"
+    printf '\n'
+}
+
+cmd_read_public() {
+    [ $# -eq 2 ] || fail 2 BAD_ARGUMENT "usage: read-public PATH MAXBYTES"
+    valid_uint "$2" || fail 2 BAD_ARGUMENT "MAXBYTES must be an integer"
+    resolve_allowed "$1"
+    [ -e "$1" ] || fail 12 NOT_FOUND "no such file"
+    [ -f "$CP" ] || fail 2 BAD_ARGUMENT "not a regular file"
+    case "$CP" in
+        *.p12 | *.pfx | *.jks | *.key) fail 5 PRIVATE_KEY_REFUSED "refusing to read key containers via read-public" ;;
+    esac
+    if grep -a -q 'PRIVATE KEY' -- "$CP"; then
+        fail 5 PRIVATE_KEY_REFUSED "file contains private key material"
+    fi
+    rp_size=$(stat -c '%s' -- "$CP")
+    [ "$rp_size" -le "$2" ] || fail 11 TOO_LARGE "file is larger than MAXBYTES"
+    printf '{"ok":true,"path":%s,"size":%s,"base64":"%s"}\n' "$(js "$1")" "$rp_size" "$(b64 <"$CP")"
+}
+
+cmd_backup() {
+    [ $# -eq 1 ] || fail 2 BAD_ARGUMENT "usage: backup PATH"
+    resolve_allowed "$1"
+    [ -e "$1" ] || fail 12 NOT_FOUND "no such file"
+    [ -f "$CP" ] || fail 2 BAD_ARGUMENT "not a regular file"
+    bk_size=$(stat -c '%s' -- "$CP")
+    [ "$bk_size" -le "$MAX_STAGED_BYTES" ] || fail 11 TOO_LARGE "file too large to back up"
+    printf '{"ok":true,"stat":%s,"base64":"%s"}\n' "$(stat_json "$1")" "$(b64 <"$CP")"
+}
+
+classify_file() { # classify_file PATH -> prints kind (never file content)
+    cf=$1
+    case "$cf" in
+        *.p12 | *.pfx) printf pkcs12; return 0 ;;
+        *.jks) printf jks; return 0 ;;
+    esac
+    [ -f "$cf" ] && [ -r "$cf" ] || { printf unknown; return 0; }
+    cf_head=$(mktemp)
+    head -c 2097152 -- "$cf" >"$cf_head" 2>/dev/null || true
+    nc=$(grep -a -c -E -- '-----BEGIN (TRUSTED |X509 )?CERTIFICATE-----' "$cf_head" || true)
+    nk=$(grep -a -c -E -- '-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----' "$cf_head" || true)
+    nr=$(grep -a -c -E -- '-----BEGIN (NEW )?CERTIFICATE REQUEST-----' "$cf_head" || true)
+    no=$(grep -a -c -- '-----BEGIN ' "$cf_head" || true)
+    rm -f -- "$cf_head"
+    if [ "$nc" -ge 1 ] && [ "$nk" -ge 1 ]; then printf combined_pem
+    elif [ "$nk" -ge 1 ]; then printf private_key
+    elif [ "$nc" -gt 1 ]; then printf cert_bundle
+    elif [ "$nc" -eq 1 ]; then printf certificate
+    elif [ "$nr" -ge 1 ]; then printf csr
+    elif [ "$no" -ge 1 ]; then printf unrelated_pem
+    else printf unknown; fi
+}
+
+cmd_find() {
+    [ $# -eq 3 ] || fail 2 BAD_ARGUMENT "usage: find ROOT MAXDEPTH MAXFILES"
+    valid_uint "$2" && valid_uint "$3" || fail 2 BAD_ARGUMENT "MAXDEPTH and MAXFILES must be integers"
+    [ "$2" -le 20 ] || fail 2 BAD_ARGUMENT "MAXDEPTH too large"
+    [ "$3" -le 100000 ] || fail 2 BAD_ARGUMENT "MAXFILES too large"
+    resolve_allowed "$1"
+    [ -d "$CP" ] || fail 12 NOT_FOUND "root is not a directory"
+    fd_list=$(mktemp)
+    # -P (default): symlinks are never followed, so no loops. Symlinked files are listed (-type l).
+    find "$CP" -maxdepth "$2" \( -type f -o -type l \) \
+        \( -name '*.pem' -o -name '*.crt' -o -name '*.cer' -o -name '*.cert' -o -name '*.key' -o -name '*.p12' -o -name '*.pfx' -o -name '*.jks' \) \
+        -print 2>/dev/null | head -n "$(($3 + 1))" >"$fd_list" || true
+    n=0
+    trunc=false
+    while IFS= read -r f; do
+        if [ "$n" -ge "$3" ]; then trunc=true; break; fi
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        if [ -L "$f" ]; then
+            fc=$(canon "$f")
+            if ! is_allowed "$fc"; then continue; fi
+        fi
+        kind=$(classify_file "$f")
+        printf '{"path":%s,"kind":%s}\n' "$(js "$f")" "$(js "$kind")"
+        n=$((n + 1))
+    done <"$fd_list"
+    rm -f -- "$fd_list"
+    printf '{"done":true,"count":%s,"truncated":%s}\n' "$n" "$trunc"
+}
+
+cmd_dump() {
+    [ $# -eq 1 ] || fail 2 BAD_ARGUMENT "usage: dump nginx|apache|haproxy"
+    case "$1" in
+        nginx)
+            nb=$(nginx_bin)
+            rc=0
+            "$nb" -T </dev/null || rc=$?
+            [ "$rc" -eq 0 ] || exit 9
+            ;;
+        apache)
+            ac=$(apache_ctl)
+            case "$ac" in
+                */apachectl | */apache2ctl) incl=$("$ac" -t -D DUMP_INCLUDES 2>&1 </dev/null) || true
+                    sroot=$("$ac" -V 2>&1 </dev/null | sed -n 's|.*-D HTTPD_ROOT="\([^"]*\)".*|\1|p' | head -n1 || true) ;;
+                *) incl=$("$ac" -t -D DUMP_INCLUDES 2>&1 </dev/null) || true
+                    sroot=$("$ac" -V 2>&1 </dev/null | sed -n 's|.*-D HTTPD_ROOT="\([^"]*\)".*|\1|p' | head -n1 || true) ;;
+            esac
+            printf '# cdp-server-root: %s\n' "${sroot:-/etc/apache2}"
+            printf '%s\n' "$incl" | sed -n 's/^ *([^)]*) \(\/.*\)$/\1/p' | while IFS= read -r f; do
+                [ -f "$f" ] && [ -r "$f" ] || continue
+                fc=$(canon "$f")
+                if ! is_allowed "$fc"; then
+                    printf '# skipped %s: outside allowed roots\n' "$f"
+                    continue
+                fi
+                printf '# configuration file %s:\n' "$f"
+                cat -- "$f"
+                printf '\n'
+            done
+            ;;
+        haproxy)
+            haproxy_bin >/dev/null
+            set -f
+            for c in $HAPROXY_CFG ${HAPROXY_EXTRA_CFG:-}; do
+                cc=$(canon "$c")
+                is_allowed "$cc" || { printf '# skipped %s: outside allowed roots\n' "$c"; continue; }
+                if [ -d "$cc" ]; then
+                    for f in "$cc"/*.cfg; do
+                        [ -f "$f" ] || continue
+                        printf '# configuration file %s:\n' "$f"
+                        cat -- "$f"
+                        printf '\n'
+                    done
+                elif [ -f "$cc" ]; then
+                    printf '# configuration file %s:\n' "$c"
+                    cat -- "$cc"
+                    printf '\n'
+                fi
+            done
+            set +f
+            ;;
+        *) fail 2 BAD_ARGUMENT "unknown service" ;;
+    esac
+}
+
+cmd_df() {
+    [ $# -eq 1 ] || fail 2 BAD_ARGUMENT "usage: df PATH"
+    resolve_allowed "$1"
+    d=$CP
+    while [ ! -d "$d" ] && [ "$d" != "/" ]; do d=$(dirname -- "$d"); done
+    avail=$(df -Pk -- "$d" | awk 'NR==2{print $4}')
+    valid_uint "$avail" || fail 9 COMMAND_FAILED "df failed"
+    printf '{"ok":true,"path":%s,"available_bytes":%s}\n' "$(js "$1")" "$((avail * 1024))"
+}
+
+cmd_stage_dir() {
+    [ $# -eq 0 ] || fail 2 BAD_ARGUMENT "usage: stage-dir"
+    mkdir -p -- "$STAGING_ROOT"
+    chmod 0700 -- "$STAGING_ROOT"
+    sd=$(mktemp -d "$STAGING_ROOT/s.XXXXXXXX") || fail 6 DISK_FULL "cannot create staging dir"
+    chmod 0700 -- "$sd"
+    printf '{"ok":true,"stage_dir":%s}\n' "$(js "$(canon "$sd")")"
+}
+
+cmd_write_staged() {
+    [ $# -eq 3 ] || fail 2 BAD_ARGUMENT "usage: write-staged STAGEDIR NAME MODE"
+    resolve_staging "$1"
+    valid_name "$2" || fail 2 BAD_ARGUMENT "invalid file name"
+    valid_mode "$3" || fail 2 BAD_ARGUMENT "invalid mode"
+    ws_tmp="$SD/.$2.part"
+    ws_err=$(mktemp)
+    rm -f -- "$ws_tmp"
+    # read at most limit*4/3+16 bytes of base64 (+1 to detect overflow)
+    lim=$((MAX_STAGED_BYTES / 3 * 4 + 64))
+    ws_rc=0
+    ( set -C; head -c "$((lim + 1))" | base64 -d >"$ws_tmp" ) 2>"$ws_err" || ws_rc=$?
+    if [ "$ws_rc" -ne 0 ]; then
+        ws_msg=$(head -c 300 "$ws_err" || true)
+        rm -f -- "$ws_tmp" "$ws_err"
+        case "$ws_msg" in
+            *"No space"*) fail 6 DISK_FULL "no space left on device" ;;
+            *) fail 2 BAD_ARGUMENT "invalid base64 input" ;;
+        esac
+    fi
+    rm -f -- "$ws_err"
+    ws_size=$(stat -c '%s' -- "$ws_tmp")
+    if [ "$ws_size" -gt "$MAX_STAGED_BYTES" ]; then
+        rm -f -- "$ws_tmp"
+        fail 11 TOO_LARGE "staged content too large"
+    fi
+    chmod "$3" -- "$ws_tmp"
+    mv -f -- "$ws_tmp" "$SD/$2"
+    printf '{"ok":true,"stat":%s}\n' "$(stat_json "$SD/$2")"
+}
+
+cmd_install() {
+    [ $# -eq 5 ] || fail 2 BAD_ARGUMENT "usage: install STAGED DEST MODE OWNER GROUP"
+    valid_mode "$3" || fail 2 BAD_ARGUMENT "invalid mode"
+    valid_name "$4" || fail 2 BAD_ARGUMENT "invalid owner"
+    valid_name "$5" || fail 2 BAD_ARGUMENT "invalid group"
+    # staged file: regular file directly inside a stage dir under STAGING_ROOT
+    check_arg_path "$1"
+    [ ! -L "$1" ] || fail 3 PATH_NOT_ALLOWED "staged file must not be a symlink"
+    resolve_staging "$(dirname -- "$1")"
+    [ -f "$1" ] || fail 12 NOT_FOUND "staged file does not exist"
+    in_staged="$SD/$(basename -- "$1")"
+    # destination
+    check_arg_path "$2"
+    in_dest=$(canon "$2")
+    is_allowed "$in_dest" || fail 3 PATH_NOT_ALLOWED "destination is outside the allowed roots"
+    if [ -L "$2" ]; then
+        # a symlink destination is only acceptable when it resolves to an existing regular file
+        # inside the allowed roots; the link itself is preserved and its target is replaced
+        if [ ! -f "$in_dest" ]; then
+            fail 7 SYMLINK_DEST "destination is a symlink that does not resolve to a regular file"
+        fi
+    elif [ -e "$in_dest" ] && [ ! -f "$in_dest" ]; then
+        fail 7 SYMLINK_DEST "destination exists and is not a regular file"
+    fi
+    in_dir=$(dirname -- "$in_dest")
+    [ -d "$in_dir" ] || fail 12 NOT_FOUND "destination directory does not exist"
+    in_tmp="$in_dest.cdp-tmp.$$"
+    in_err=$(mktemp)
+    in_rc=0
+    ( set -C; cat -- "$in_staged" >"$in_tmp" ) 2>"$in_err" || in_rc=$?
+    if [ "$in_rc" -ne 0 ]; then
+        in_msg=$(head -c 300 "$in_err" || true)
+        rm -f -- "$in_tmp" "$in_err"
+        case "$in_msg" in
+            *"No space"*) fail 6 DISK_FULL "no space left on device" ;;
+            *) fail 4 PERMISSION_DENIED "cannot write destination" ;;
+        esac
+    fi
+    rm -f -- "$in_err"
+    if ! { sync -- "$in_tmp" 2>/dev/null || true; chown -- "$4:$5" "$in_tmp" && chmod -- "$3" "$in_tmp"; }; then
+        rm -f -- "$in_tmp"
+        fail 4 PERMISSION_DENIED "chown/chmod failed (unknown owner or group?)"
+    fi
+    if command -v chcon >/dev/null 2>&1 && command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled 2>/dev/null; then
+        if [ -e "$in_dest" ]; then
+            chcon --reference="$in_dest" -- "$in_tmp" 2>/dev/null || true
+        elif command -v restorecon >/dev/null 2>&1; then
+            restorecon -- "$in_tmp" 2>/dev/null || true
+        fi
+    fi
+    if ! mv -f -- "$in_tmp" "$in_dest"; then
+        rm -f -- "$in_tmp"
+        fail 4 PERMISSION_DENIED "atomic rename failed"
+    fi
+    printf '{"ok":true,"stat":%s}\n' "$(stat_json "$in_dest")"
+}
+
+cmd_configtest() {
+    [ $# -eq 1 ] || fail 2 BAD_ARGUMENT "usage: configtest nginx|apache|haproxy"
+    ct_svc=$1
+    case "$ct_svc" in
+        nginx) nb=$(nginx_bin); capture "$nb" -t ;;
+        apache)
+            ac=$(apache_ctl)
+            case "$ac" in
+                */apachectl | */apache2ctl) capture "$ac" configtest ;;
+                *) capture "$ac" -t ;;
+            esac ;;
+        haproxy)
+            hb=$(haproxy_bin)
+            set -f
+            set --
+            for c in $HAPROXY_CFG ${HAPROXY_EXTRA_CFG:-}; do set -- "$@" -f "$c"; done
+            set +f
+            capture "$hb" -c "$@" ;;
+        *) fail 2 BAD_ARGUMENT "unknown service" ;;
+    esac
+    emit_result "$ct_svc" configtest
+}
+
+haproxy_reload() { # haproxy_reload ALLOW_RESTART
+    hr_allow=$1
+    hb=$(haproxy_bin)
+    set -f
+    set --
+    for c in $HAPROXY_CFG ${HAPROXY_EXTRA_CFG:-}; do set -- "$@" -f "$c"; done
+    set +f
+    if [ -f "$HAPROXY_PIDFILE" ] && is_running haproxy; then
+        old=$(tr '\n' ' ' <"$HAPROXY_PIDFILE")
+        set -f
+        # shellcheck disable=SC2086
+        capture "$hb" "$@" -D -p "$HAPROXY_PIDFILE" -sf $old
+        set +f
+        return 0
+    fi
+    if [ "$hr_allow" = 1 ]; then
+        capture "$hb" "$@" -D -p "$HAPROXY_PIDFILE"
+        return 0
+    fi
+    fail 13 NOT_RUNNING "haproxy is not running (use --allow-restart to start it)"
+}
+
+cmd_reload() {
+    allow=0
+    svc=""
+    for a in "$@"; do
+        case "$a" in
+            --allow-restart) allow=1 ;;
+            nginx | apache | haproxy) [ -z "$svc" ] || fail 2 BAD_ARGUMENT "one service only"; svc=$a ;;
+            *) fail 2 BAD_ARGUMENT "usage: reload nginx|apache|haproxy [--allow-restart]" ;;
+        esac
+    done
+    [ -n "$svc" ] || fail 2 BAD_ARGUMENT "usage: reload nginx|apache|haproxy [--allow-restart]"
+    action=reload
+    case "$svc" in
+        nginx)
+            nb=$(nginx_bin)
+            if use_systemd && unit_exists nginx; then
+                capture systemctl reload nginx
+                if [ "$CAP_RC" -ne 0 ] && [ "$allow" = 1 ]; then action=restart; capture systemctl restart nginx; fi
+            elif is_running nginx; then
+                capture "$nb" -s reload
+                if [ "$CAP_RC" -ne 0 ] && [ "$allow" = 1 ]; then
+                    action=restart; capture "$nb" -s stop; sleep 1; capture "$nb"
+                fi
+            elif [ "$allow" = 1 ]; then
+                action=restart; capture "$nb"
+            else
+                fail 13 NOT_RUNNING "nginx is not running (use --allow-restart to start it)"
+            fi ;;
+        apache)
+            ac=$(apache_ctl)
+            au=$(apache_unit || true)
+            if use_systemd && [ -n "$au" ]; then
+                capture systemctl reload "$au"
+                if [ "$CAP_RC" -ne 0 ] && [ "$allow" = 1 ]; then action=restart; capture systemctl restart "$au"; fi
+            elif is_running apache2 httpd; then
+                capture "$ac" -k graceful
+                if [ "$CAP_RC" -ne 0 ] && [ "$allow" = 1 ]; then action=restart; capture "$ac" -k restart; fi
+            elif [ "$allow" = 1 ]; then
+                action=restart; capture "$ac" -k start
+            else
+                fail 13 NOT_RUNNING "apache is not running (use --allow-restart to start it)"
+            fi ;;
+        haproxy)
+            if use_systemd && unit_exists haproxy; then
+                capture systemctl reload haproxy
+                if [ "$CAP_RC" -ne 0 ] && [ "$allow" = 1 ]; then action=restart; capture systemctl restart haproxy; fi
+            else
+                haproxy_reload "$allow"
+            fi ;;
+    esac
+    emit_result "$svc" "$action"
+}
+
+cmd_cleanup() {
+    [ $# -eq 1 ] || fail 2 BAD_ARGUMENT "usage: cleanup STAGEDIR"
+    resolve_staging "$1"
+    rm -rf -- "$SD"
+    printf '{"ok":true}\n'
+}
+
+# ----------------------------------------------------------------------------- main
+[ $# -ge 1 ] || fail 2 BAD_ARGUMENT "usage: cdp-helper SUBCOMMAND [ARGS...]"
+SUB=$1
+shift
+if [ "$(id -u)" != "0" ] && [ "$SUB" != "version" ]; then
+    fail 4 PERMISSION_DENIED "cdp-helper must run as root (via sudo)"
+fi
+load_conf
+case "$SUB" in
+    version) cmd_version ;;
+    probe) cmd_probe ;;
+    stat) cmd_stat "$@" ;;
+    read-public) cmd_read_public "$@" ;;
+    backup) cmd_backup "$@" ;;
+    find) cmd_find "$@" ;;
+    dump) cmd_dump "$@" ;;
+    df) cmd_df "$@" ;;
+    stage-dir) cmd_stage_dir "$@" ;;
+    write-staged) cmd_write_staged "$@" ;;
+    install) cmd_install "$@" ;;
+    configtest) cmd_configtest "$@" ;;
+    reload) cmd_reload "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    *) fail 2 BAD_ARGUMENT "unknown subcommand" ;;
+esac

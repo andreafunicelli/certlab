@@ -1,0 +1,27 @@
+# Reverse proxy: the ONLY service published to the host.
+# CDP_DOMAIN: public/internal DNS name of the console.
+# CDP_TLS_DIRECTIVE (compose env, default "tls internal" = Caddy private CA):
+#   ACME (public DNS + port 80/443 reachable): "tls admin@example.com"
+#   Own certificate: "tls /certs/fullchain.pem /certs/privkey.pem" and mount ./certs:/certs:ro
+{$CDP_DOMAIN:localhost} {
+	encode gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+	request_body /api/* {
+		max_size 2MB
+	}
+	handle /api/* {
+		reverse_proxy api:8000 {
+			flush_interval -1
+		}
+	}
+	handle {
+		reverse_proxy frontend:3000
+	}
+	{$CDP_TLS_DIRECTIVE}
+}

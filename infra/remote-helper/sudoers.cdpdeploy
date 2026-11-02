@@ -1,0 +1,2 @@
+Defaults:cdpdeploy env_reset
+cdpdeploy ALL=(root) NOPASSWD: /usr/local/libexec/cdp-helper

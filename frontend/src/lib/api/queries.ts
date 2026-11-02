@@ -233,17 +233,14 @@ export const api = {
     cancel: (id: string) => post<DeploymentJob>(`/deployments/${id}/cancel`),
     retry: (id: string) => post<DeploymentJob>(`/deployments/${id}/retry`),
     rollback: (id: string, targetId: string) =>
-      post<RestoreQueued>(
-        `/deployments/${id}/targets/${enc(targetId)}/rollback`,
-      ),
+      post<RestoreQueued>(`/deployments/${id}/targets/${enc(targetId)}/rollback`),
     /** SSE endpoint URL for EventSource (same origin, cookie auth). */
     eventsUrl: (id: string) => `${API_BASE}/deployments/${id}/events`,
   },
   backups: {
     list: (q?: Query) => get<Page<Backup>>("/backups", q),
     get: (id: string) => get<Backup>(`/backups/${id}`),
-    restore: (id: string) =>
-      post<RestoreQueued & { backup: Backup }>(`/backups/${id}/restore`),
+    restore: (id: string) => post<RestoreQueued & { backup: Backup }>(`/backups/${id}/restore`),
   },
   discoveryJobs: {
     list: (q?: Query) => get<Page<DiscoveryJob>>("/discovery-jobs", q),
@@ -495,9 +492,9 @@ export const useCertificate = (id: string | null | undefined) =>
     enabled: !!id,
     // Restores run in a worker: poll while one is in progress so the status settles on screen.
     refetchInterval: (q) =>
-      (q.state.data as { backups?: { restore_status?: string | null }[] } | undefined)?.backups?.some(
-        (b) => b.restore_status === "in_progress",
-      )
+      (
+        q.state.data as { backups?: { restore_status?: string | null }[] } | undefined
+      )?.backups?.some((b) => b.restore_status === "in_progress")
         ? 3000
         : false,
   });

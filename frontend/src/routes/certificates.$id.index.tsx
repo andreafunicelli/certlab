@@ -387,7 +387,8 @@ function CertificateDetail() {
               restore.mutateAsync(bid).then((r) => {
                 if (r.accepted)
                   toast.info("Restore queued", {
-                    description: "Follow the backup's restore status; it updates when the worker finishes.",
+                    description:
+                      "Follow the backup's restore status; it updates when the worker finishes.",
                   });
                 else toast.error("Restore was not accepted");
                 setRestoreId(null);

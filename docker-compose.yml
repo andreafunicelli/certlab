@@ -1,0 +1,128 @@
+# Cert Deploy Pro — single-VM self-hosted deployment.
+# Only the `proxy` service publishes ports. PostgreSQL and Redis live on the internal
+# network and are never exposed. Secrets come from .env and ./secrets (never baked into images).
+name: cert-deploy-pro
+
+x-backend: &backend
+  build: ./backend
+  image: cert-deploy-pro/backend:${CDP_VERSION:-local}
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    CDP_DATABASE_URL: postgresql+psycopg://cdp:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/cdp
+    CDP_REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+    CDP_MASTER_KEY_FILE: /run/secrets/cdp_master_key
+    CDP_ARTIFACT_DIR: /var/lib/cdp/artifacts
+  secrets: [cdp_master_key]
+  volumes:
+    - artifacts:/var/lib/cdp/artifacts
+  networks: [internal]
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    migrate: { condition: service_completed_successfully }
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: cdp
+      POSTGRES_USER: cdp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cdp -d cdp"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy: { resources: { limits: { memory: 1g } } }
+    stop_grace_period: 60s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD}", "--protected-mode", "yes"]
+    volumes: [redisdata:/data]
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    deploy: { resources: { limits: { memory: 256m } } }
+
+  migrate:
+    <<: *backend
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    <<: *backend
+    deploy: { resources: { limits: { memory: 768m } } }
+    stop_grace_period: 30s
+
+  worker:
+    <<: *backend
+    command: ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=INFO", "--concurrency=${CDP_WORKER_CONCURRENCY:-4}"]
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10 | grep -q pong"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+    deploy: { resources: { limits: { memory: 1g } } }
+    # Give in-flight deployment steps time to reach a safe checkpoint.
+    stop_grace_period: 300s
+
+  beat:
+    <<: *backend
+    command: ["celery", "-A", "app.workers.celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat-schedule"]
+    healthcheck: { disable: true }
+    deploy: { resources: { limits: { memory: 256m } } }
+
+  frontend:
+    build: ./frontend
+    image: cert-deploy-pro/frontend:${CDP_VERSION:-local}
+    restart: unless-stopped
+    networks: [internal]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    deploy: { resources: { limits: { memory: 512m } } }
+
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "${CDP_HTTP_PORT:-80}:80"
+      - "${CDP_HTTPS_PORT:-443}:443"
+    environment:
+      CDP_DOMAIN: ${CDP_DOMAIN:-localhost}
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+    networks: [internal]
+    depends_on: [api, frontend]
+
+secrets:
+  cdp_master_key:
+    file: ./secrets/cdp_master_key
+
+volumes:
+  pgdata:
+  redisdata:
+  artifacts:
+  caddydata:
+
+networks:
+  internal:

@@ -10,3 +10,4 @@ __pycache__/
 backend/var/
 frontend/test-results/
 frontend/playwright-report/
+secrets/

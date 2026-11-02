@@ -1,0 +1,26 @@
+# Reverse proxy: the ONLY service published to the host.
+# Set CDP_DOMAIN to a real DNS name for automatic HTTPS (ACME), or keep "localhost"
+# for an internal CA certificate. To use your own certificate, replace `tls internal`
+# with `tls /certs/fullchain.pem /certs/privkey.pem` and mount them.
+{$CDP_DOMAIN:localhost} {
+	encode gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+	request_body /api/* {
+		max_size 2MB
+	}
+	handle /api/* {
+		reverse_proxy api:8000 {
+			flush_interval -1
+		}
+	}
+	handle {
+		reverse_proxy frontend:3000
+	}
+	{$CDP_TLS_DIRECTIVE:tls internal}
+}

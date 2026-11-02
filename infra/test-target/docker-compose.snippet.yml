@@ -1,0 +1,16 @@
+# NOT EXERCISED in the authoring environment. Merge into a compose file for registry-enabled environments.
+# Test credentials are generated inside the container under /var/lib/cdp-test (mount a volume to read them).
+services:
+  cdp-test-target:
+    build:
+      context: ../..
+      dockerfile: infra/test-target/Dockerfile
+    volumes:
+      - cdp-test-state:/var/lib/cdp-test
+    ports:
+      - "127.0.0.1:2222:2222"
+      - "127.0.0.1:8443:8443"
+      - "127.0.0.1:9443:9443"
+      - "127.0.0.1:10443:10443"
+volumes:
+  cdp-test-state:

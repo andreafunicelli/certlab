@@ -1,0 +1,13 @@
+# /etc/cdp-helper.conf - sourced by /usr/local/libexec/cdp-helper (POSIX sh syntax).
+# Must be owned by root with mode 0644; the helper refuses to run otherwise.
+# Space separated list of directory roots the helper may read/write (symlinks are resolved first).
+ALLOWED_ROOTS="/etc/ssl /etc/pki /etc/nginx /etc/apache2 /etc/httpd /etc/letsencrypt /etc/haproxy /opt /usr/local/etc"
+STAGING_ROOT=/var/lib/cdp-helper/staging
+HAPROXY_CFG=/etc/haproxy/haproxy.cfg
+#HAPROXY_EXTRA_CFG="/etc/haproxy/conf.d"
+HAPROXY_PIDFILE=/run/haproxy.pid
+#NGINX_BIN=/usr/sbin/nginx
+#APACHE_CTL=/usr/sbin/apachectl
+#APACHE_BIN=/usr/sbin/httpd
+#HAPROXY_BIN=/usr/sbin/haproxy
+MAX_STAGED_BYTES=10485760

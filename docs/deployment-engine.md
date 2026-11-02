@@ -217,7 +217,23 @@ raised while building a target is passed through as a blocking finding.
 
 - `awaiting_approval`: cancelled at once, and all targets become `cancelled` with `CANCELLED`.
 - Any other non-terminal job: `cancel_requested` is set. It is honoured only at the checkpoints in section 14.
-- A `pending` job whose message never reached a worker is not cancelled by this call (section 18, K5).
+- `pending` (no worker has started it): cancelled at once, with a guarded `UPDATE ... WHERE status = 'pending'` so a worker that starts
+  at the same moment wins. All targets become `cancelled` with `CANCELLED`, and a late delivery of the queue message returns
+  `cancelled` without touching any host (K5, fixed).
+- The response of `POST /api/v1/deployments/{id}/cancel` carries a `cancel` object with `effect` (`cancelled`, `requested` or
+  `too_late`) and a `message`. `too_late` means activation already started on `targets_in_activation` targets: they run to
+  completion or roll back, and only targets that have not started are skipped (K7, kept by design, section 14).
+
+### 4.3.1 Dispatch failures and the pending sweep
+
+- `create`, `approve` and `retry` hand the job to Celery after the commit. If the broker refuses the message, the job is set to
+  `failed` with `QUEUE_UNAVAILABLE`, its targets to `cancelled`, an audit event `DEPLOYMENT_QUEUE_FAILED` is written, and the
+  API answers 503 `QUEUE_UNAVAILABLE` (K4, fixed).
+- Every hand-over increments `deployment_jobs.dispatch_attempts` and sets `last_dispatched_at`. The beat task
+  `deployments.sweep_pending` (every 5 minutes) finds jobs that are `pending`, approved (or not requiring approval), not started and
+  last dispatched more than 10 minutes ago (`PENDING_REDISPATCH_MINUTES`). It re-dispatches them, at most 3 attempts in total
+  (`MAX_DISPATCH_ATTEMPTS`), then fails them with `QUEUE_LOST` (audit `DEPLOYMENT_REDISPATCHED` / `DEPLOYMENT_QUEUE_FAILED`).
+  Duplicate delivery is harmless: the job lock and the persisted state make a run idempotent (K5, fixed).
 
 ### 4.4 Retrying
 
@@ -285,8 +301,8 @@ Each target has one status. The table is what the engine writes (`set_status` an
 | `activating` | `activate` and `config_test` steps | No |
 | `reloading` | `reload` step | No |
 | `verifying` | `verify` step | No |
-| `completed` | `finalize` | Yes |
-| `failed` | pre-mutation failure (`_run`), or a failure after verification (**Known issue** K2) | Yes |
+| `completed` | `finalize`, or the degraded finalize path when the database refuses it but files and endpoint were verified (section 12) | Yes |
+| `failed` | pre-mutation failure (`_run`), including `LOCK_LOST` before activation. A failure after the files were replaced is never `failed` (K2, fixed): it is `completed` (verified) or `manual_intervention_required` | Yes |
 | `cancelled` | cancellation at a checkpoint (`CANCELLED`), or `SKIPPED` by the scheduler | Yes |
 | `rolling_back` | `rollback` step | No |
 | `rolled_back` | verified rollback | Yes |
@@ -332,8 +348,8 @@ redacted detail). `GET /api/v1/deployments/{id}` returns them.
 | `config_test` | `activating` | Runs the config test for each service. | `CONFIG_TEST_FAILED` |
 | `reload` | `reloading` | Reloads each service. | `RELOAD_FAILED` |
 | `verify` | `verifying` | Probes endpoints and re-hashes files (section 11). | `VERIFY_*` (section 11.3) |
-| `cleanup` | unchanged | Removes the staging directory. | |
-| `finalize` | unchanged | Writes installation and version state (section 12). | **Known issue** K2 |
+| `cleanup` | unchanged | Removes the staging directory. Best effort: a failure here never changes the target's outcome. | |
+| `finalize` | unchanged | Writes installation and version state (section 12). Retried, idempotent. | `FINALIZE_FAILED` (degraded path) |
 | `rollback` | `rolling_back` | Restores the backup (`rollback.md`). | `ROLLBACK_*` |
 | `reconcile` | unchanged | Resume-only classification (section 13). | `RECONCILE_FAILED` |
 
@@ -361,8 +377,11 @@ Lock state is in the `deployment_locks` table (`services/locks.py`). It is durab
 - **Job lock conflict:** if another live worker holds the job lock, the Celery task retries after 30 seconds, up to 60
   times (`deploy_tasks.run_deployment`).
 
-**Known issue (K6).** `LockSet.lost` is set when a heartbeat renewal fails, and a log line is written. Nothing reads the
-flag, so the engine keeps working after a lock is lost (grep confirms no reader).
+**Lost locks (K6, fixed).** `LockSet.lost` is set when a heartbeat renewal finds the lock gone, or when renewals keep erroring
+for longer than the TTL. The engine reads it (`UnitRunner.ensure_locks`) at the `before_backup` and `before_activation`
+checkpoints, before every file install and before the reload. A lost lock raises `LOCK_LOST`: before activation the target
+ends `failed` and the host is untouched; during activation the normal verified rollback runs (the rollback itself does not
+need the lock check).
 
 ---
 
@@ -444,25 +463,28 @@ Endpoints come from `verify_endpoints_for(installation, server)`:
 
 - host: `verify_host`, else the server address, else the hostname;
 - port: `verify_port`, else `listen_port`;
-- SNI: `verify_sni`, else `vhost`, else the first usable server name.
+- SNI: `services/verify_sni.resolve_verify_sni` (K1, fixed), in this order:
+  1. `verify_sni`;
+  2. the first concrete (non-wildcard, non-regex) `server_name`;
+  3. for wildcard-only names: the first non-wildcard DNS SAN of the new certificate's leaf (a SAN the wildcard covers wins);
+  4. else a deterministic concrete name derived from the wildcard, `*` replaced by `cdp-verify`
+     (`*.example.com` becomes `cdp-verify.example.com`), which the wildcard still matches;
+  5. no names at all: no SNI (`None`); the probe connects to `verify_host:verify_port` and the hostname check is skipped.
 
-**Known issue (K1): the `vhost` fallback is not a hostname.** `vhost` is the composite `names:ports` string described in
-[certificate-discovery.md](certificate-discovery.md) section 6.4. Discovery normally sets `verify_sni` to a usable name,
-but it leaves it empty for:
+The composite `vhost` string is never used. Discovery fills `verify_sni` with the same helper (without a leaf, so steps 1, 2, 4
+and 5), and a manual restore resolves it with the SANs of the certificate it restores.
+
+**Previously (K1, now fixed): the `vhost` fallback was not a hostname.** `vhost` is the composite `names:ports` string described in
+[certificate-discovery.md](certificate-discovery.md) section 6.4. Discovery set `verify_sni` to a usable name,
+but left it empty for:
 
 - a wildcard-only `server_name`, such as `*.example.com`;
 - a server with no `server_name`, such as the nginx default server or an haproxy bind with no names.
 
-For these installations the planner's SNI becomes a non-hostname string. This was checked by calling the real
-`_Resolver.resolve()` and `planner.verify_endpoints_for()` on a fake host (a read-only run). The results were
-`*.example.com:443` for the wildcard case and `-:8443` for the nameless case. Neither can match a certificate's
-hostname check, so the verification at the end of a deployment fails (`VERIFY_HOSTNAME_MISMATCH` or
-`VERIFY_UNREACHABLE`), and the deployment rolls back unless `allow_file_only_verification` is set. Installations with
-an explicit `verify_sni` are not affected. The live tests and unit fixtures always set `verify_sni`, so no test
-exercises this path. The inventory verify action uses a separate rule (`inventory.endpoint_for`) that skips wildcards,
-so the same installation can pass "Verify" and still fail a deployment.
-
-Work-around until fixed (**unverified**): set `verify_sni` on the installation with `PATCH /api/v1/installations/{id}`.
+For these installations the planner's SNI was a non-hostname string (`*.example.com:443`, `-:8443`), the verification at the
+end of a deployment failed and the deployment rolled back. Unit tests `test_verify_sni.py` now cover wildcard-only and
+nameless installations end to end. The inventory verify action still uses its own rule (`inventory.endpoint_for`), which skips
+wildcards; an explicit `verify_sni` set with `PATCH /api/v1/installations/{id}` always wins everywhere.
 
 ### 11.3 Verification procedure
 
@@ -485,8 +507,16 @@ Work-around until fixed (**unverified**): set `verify_sni` on the installation w
 4. Store the result in `target.verification`: `mode` (`live` or `file_only`), endpoint rows, file hashes, `chain_valid`,
    and a timestamp.
 
-`chain_valid` is recorded per endpoint and in aggregate. **It is not enforced.** A `False` value does not fail the
-deployment. The probe checks the chain against the configured trust anchors or the system store.
+`chain_valid` is recorded per endpoint and in aggregate. The probe checks the chain against the configured trust anchors or the
+system store. **Enforcement is per environment (K8, fixed):** `environments.require_trusted_chain` (default `false`; migration
+0004 sets it to `true` for an environment named `Production`). When it is `true`:
+
+- preflight adds a blocking `CHAIN_UNTRUSTED` finding for every target in that environment if the bundle's chain does not
+  validate against the trust anchors (`services/trust.py`: system store plus `security.trust_anchors_pem`);
+- verification fails with `VERIFY_CHAIN_UNTRUSTED` (and rolls back) if any reachable endpoint reports `chain_valid = False`.
+  `None` (unknown, for example a TLS error that is not a verification error) does not fail it.
+
+When it is `false`, `chain_valid` stays informational, as before. The flag is part of the environments API (create, update, out).
 
 ---
 
@@ -499,6 +529,23 @@ deployment. The probe checks the chain against the configured trust anchors or t
   records `ok: true` with `source: deployment` and the verify mode.
 - The version becomes `deployed`, and its `certificate_id` is set if it was empty.
 - The target and the job become `completed`. Notifications are sent at job level.
+
+**Failure handling after verification (K2, fixed).** Everything in `_complete` runs after the files and the endpoint were
+verified, so it cannot undo that:
+
+1. The verification result is written to `target.verification` first.
+2. `cleanup` is best effort. An exception is logged and ignored.
+3. `finalize` is idempotent (`_ensure_certificate` tolerates an existing row, the rest are plain assignments) and is retried up to
+   3 times, 0.5 seconds apart. The step history shows each attempt.
+4. If the database still refuses, the verified outcome is written through a fresh session: the target becomes `completed` when
+   the files were re-hashed and the endpoint verified (or `file_only` verification was explicitly allowed by the strategy),
+   with a log entry that the records could not be finalised (inventory refreshes at the next discovery). Otherwise it becomes
+   `manual_intervention_required` with `FINALIZE_FAILED`, and `rollback.failed` is notified.
+5. Any other unexpected exception after files were replaced ends in `manual_intervention_required`, never plain `failed`.
+   If even the fresh session fails, the error is raised and the target keeps its mutating state, so a redelivery of the task
+   resumes through reconcile (`all_new`) and verifies again.
+
+No path leaves new files without either verified success or a rollback.
 
 ---
 
@@ -542,8 +589,9 @@ Cancellation is checked only at these points:
 At a checkpoint, a cancel request stops the unit with status `cancelled` and the text `cancelled by user before any change
 was made`. The staging directory is removed. Nothing has been changed on the remote host at that point.
 
-**After `before_activation`, a cancel request is not honoured.** The unit continues to completion or to a rollback.
-`cancel_requested` stays set on the job.
+**After `before_activation`, a cancel request is not honoured (K7, kept by design).** The unit continues to completion or to a
+rollback. `cancel_requested` stays set on the job, and the cancel response says so (`cancel.effect = "too_late"`, section 4.3).
+Stopping between two file installs would leave a mixed set of files, which is exactly the state rollback exists to avoid.
 
 Each checkpoint also re-checks the initiating user. A disabled user, or one who lost `deployments:create`, produces an
 `AUTHZ` error. Before activation that is a plain `failed`. After activation it triggers a rollback.
@@ -555,9 +603,18 @@ Each checkpoint also re-checks the initiating user. A disabled user, or one who 
 Installations whose path is under `/etc/letsencrypt/live/` (or whose real path is under `archive/`) are `managed_by_certbot`.
 Preflight blocks them with `CERTBOT_MANAGED`, and creation returns 409. This is covered by live test (j).
 
-The blocking message says to use "a certbot deploy hook instead (see docs: 'certbot deploy hooks')". **No such document is in
-this repository** (searched `docs/` and the backend), and no hook integration exists in the code. The message points readers
-at something that is not here.
+**What to do instead (K13, fixed).** CDP never writes to certbot-managed paths. Leave `/etc/letsencrypt/live/` and `archive/`
+alone and let certbot renew in place. If a service reads the certificate from a different location, or must be reloaded
+after renewal, use a certbot deploy hook:
+
+- per certificate: `certbot renew --deploy-hook "systemctl reload nginx"` (or set `deploy_hook` in
+  `/etc/letsencrypt/renewal/<name>.conf`);
+- host-wide: an executable script in `/etc/letsencrypt/renewal-hooks/deploy/`. Certbot runs it after each successful renewal with
+  `RENEWED_LINEAGE` set to the live directory. The script can copy `fullchain.pem` and `privkey.pem` to the path a service reads
+  and reload that service.
+
+CDP has no hook integration; a copy made by a hook shows up as an ordinary installation at the next discovery. The blocking
+`CERTBOT_MANAGED` message now points here.
 
 ---
 
@@ -659,20 +716,24 @@ Other facts:
 
 | # | Issue | Source | Status |
 |---|---|---|---|
-| K1 | Verification SNI falls back to the composite `vhost`, which is not a hostname, for installations with no `verify_sni` (wildcard-only names, no names). Deployments then roll back. | `deployment_planner.verify_endpoints_for`, `deployment_engine._verify_new` | **Reproduced** (real functions on fake input). Not run against a live host. |
-| K2 | `_complete` runs outside the try block that covers rollback. An exception in cleanup or finalize (for example a database error after verification) marks the target `failed`. The new files stay in place, and no rollback runs. | `deployment_engine._activate_and_verify`, `_run` | From reading. |
-| K3 | A manual restore that cannot take its locks is reported as `INTERNAL_ERROR`, not `LOCK_HELD`, because `classify()` does not know `LockHeld`. The target is then set to `manual_intervention_required`. | `deployment_engine.restore_backup_async`, `classify` | **Reproduced** for the classification step. |
-| K4 | Job dispatch in `create` and `approve` is not guarded. If the broker call fails after the commit, the job stays `pending`. An identical replay returns that job without dispatching it. Discovery guards the same call and marks the job failed with `QUEUE_UNAVAILABLE`. | `deployments.create`, `approve`, `dispatch` | From reading. |
-| K5 | If a `pending` deployment's message never reaches a worker, no sweep re-dispatches it. `cancel` only sets `cancel_requested` and does not move it out of `pending`. Notification deliveries have a sweep. Discovery jobs stuck in `pending` are marked failed after 30 minutes, but deployments have no equivalent. | `workers/tasks.py`, `deployments.cancel`, `discovery._expire_stale` | From reading. See [troubleshooting.md](troubleshooting.md). |
-| K6 | `LockSet.lost` is never read. A lost lock does not stop the work. | `services/locks.py` | From reading. |
-| K7 | Cancellation after `before_activation` is not honoured. | Section 14 | Design, from reading. |
-| K8 | `chain_valid` is recorded, not enforced. | Section 11.3 | Design, from reading. |
-| K9 | `CANCELLED` is raised by the SSH layer only when a `cancel_event` is passed, and no caller passes one. | `integrations/ssh/connection.py` | From reading. |
-| K10 | The per-host SSH limit setting is not applied. The default of 4 is always used. | `connection.set_host_concurrency_limit` is never called | From reading. |
-| K11 | The staged bytes are checked by hash only. They are not re-parsed on the host. | Section 9.2 | Design. |
-| K12 | `allow_restart` can drop connections, and no live test covers it. | Section 5.2 | Design, untested. |
-| K13 | The certbot message points to a document that does not exist. | Section 15 | From grep. |
-| K14 | Units on one server are serialised. A high `concurrency` does not speed up a single server. | Section 5.1 | Design, by code. |
+| K1 | Verification SNI fell back to the composite `vhost`, which is not a hostname. | `services/verify_sni.py`, `deployment_planner.verify_endpoints_for`, `discovery._Resolver.resolve` | **Fixed.** Resolution order in section 11.2; unit tests for wildcard-only and nameless installations. |
+| K2 | `_complete` ran outside the rollback `try`; an exception in cleanup or finalize marked the target `failed` with the new files in place. | `deployment_engine.UnitRunner._complete` | **Fixed.** Verification persisted first, cleanup best effort, finalize retried and idempotent, degraded path `completed` or `manual_intervention_required` (section 12). |
+| K3 | A manual restore that could not take its locks was reported as `INTERNAL_ERROR` and set the target to `manual_intervention_required`. | `deployment_engine.classify`, `restore_backup_async` | **Fixed.** `LOCK_HELD`; the API pre-checks and answers 409; the worker leaves target and backup unchanged. |
+| K4 | Job dispatch in `create` and `approve` was not guarded. | `deployments._send` | **Fixed.** `retry` too. Broker failure: job `failed`, `QUEUE_UNAVAILABLE`, audit, 503 (section 4.3.1). |
+| K5 | A `pending` deployment whose message was lost was never re-dispatched, and `cancel` did not leave `pending`. | `deployments.sweep_stuck_pending`, `workers/deploy_tasks.py` | **Fixed.** Beat sweep (10 minutes, 3 attempts, then `QUEUE_LOST`); cancel of a pending job is immediate (section 4.3). |
+| K6 | `LockSet.lost` was never read. | `services/locks.py`, `UnitRunner.ensure_locks` | **Fixed.** `LOCK_LOST` stops the unit before the next mutating step; rollback if already activated (section 8). |
+| K7 | Cancellation after `before_activation` is not honoured. | Section 14 | **Kept.** Cancelling mid-activation would leave mixed files. The API returns `cancel.effect = "too_late"` with an explanatory message. |
+| K8 | `chain_valid` was recorded, not enforced. | Section 11.3 | **Fixed, opt-in.** `environments.require_trusted_chain` (migration 0004; default false, true for `Production`): blocking `CHAIN_UNTRUSTED` in preflight and `VERIFY_CHAIN_UNTRUSTED` (rollback) in verification. |
+| K9 | `CANCELLED` is raised by the SSH layer only when a `cancel_event` is passed, and no caller passes one. | `integrations/ssh/connection.py` | Open (not part of this change). From reading. |
+| K10 | The per-host SSH limit setting was not applied. The default of 4 was always used. | `services/ssh_limits.py`, `celery_app` signals | **Fixed.** New setting `ssh.host_concurrency` (default 4) is applied at worker start (`worker_ready`, `worker_process_init`), at the start of every deployment and restore task, and in the API process when the section is saved. `ssh.deployment_concurrency` was already applied through the strategy. |
+| K11 | The staged bytes are checked by hash only. They are not re-parsed on the host. | Section 9.2 | Design. **Kept.** |
+| K12 | `allow_restart` can drop connections, and no live test covers it. | Section 5.2 | Design, untested. **Kept.** |
+| K13 | The certbot message pointed to a document that did not exist. | Section 15 | **Fixed.** Section 15 explains certbot deploy hooks and leaving certbot-managed paths alone; the message points there. |
+| K14 | Units on one server are serialised. A high `concurrency` does not speed up a single server. | Section 5.1 | Design, by code. **Kept.** |
+
+Manual restores (`POST /api/v1/backups/{id}/restore`) and manual target rollbacks
+(`POST /api/v1/deployments/{id}/targets/{target}/rollback`) no longer run inside the HTTP request: they answer 202 and run in the
+Celery task `backups.restore` (see [rollback.md](rollback.md) section 7).
 
 Live tests were not run for this page. Each scenario listed in section 17 is asserted in `test_deploy_live.py`. Their
 results on a real target are **(unverified)**.

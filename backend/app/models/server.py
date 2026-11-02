@@ -22,6 +22,8 @@ class Environment(IdMixin, TimestampMixin, Base):
     description: Mapped[str | None] = mapped_column(String(255))
     is_production: Mapped[bool] = mapped_column(default=False, server_default="false")
     requires_approval: Mapped[bool] = mapped_column(default=False, server_default="false")
+    # strict chain enforcement: deployments verify (and roll back) on an untrusted chain, preflight blocks CHAIN_UNTRUSTED
+    require_trusted_chain: Mapped[bool] = mapped_column(default=False, server_default="false")
 
 
 class Credential(IdMixin, TimestampMixin, Base):

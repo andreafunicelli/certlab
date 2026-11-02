@@ -159,6 +159,7 @@ class EnvironmentCreate(BaseModel):
     description: str | None = Field(default=None, max_length=255)
     is_production: bool = False
     requires_approval: bool = False
+    require_trusted_chain: bool = False
 
 
 class EnvironmentUpdate(BaseModel):
@@ -166,6 +167,7 @@ class EnvironmentUpdate(BaseModel):
     description: str | None = Field(default=None, max_length=255)
     is_production: bool | None = None
     requires_approval: bool | None = None
+    require_trusted_chain: bool | None = None
 
 
 class EnvironmentOut(ORMModel):
@@ -174,4 +176,5 @@ class EnvironmentOut(ORMModel):
     description: str | None
     is_production: bool
     requires_approval: bool
+    require_trusted_chain: bool = False
     server_count: int = 0

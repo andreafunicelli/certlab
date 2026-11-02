@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import posixpath
+import time
 import uuid
 from collections.abc import Iterable
 from datetime import timedelta
@@ -149,7 +150,8 @@ class LockSet:
         self.ttl, self.beat = ttl_seconds, heartbeat_seconds
         self._held: list[str] = []
         self._task: asyncio.Task | None = None
-        self.lost = False
+        self.lost = False                 # set when a renewal fails: the engine must stop before its next change (K6)
+        self._last_ok = time.monotonic()
 
     def acquire_all(self) -> None:
         for k in self.keys:
@@ -169,13 +171,24 @@ class LockSet:
     async def _heartbeat(self) -> None:
         while True:
             await asyncio.sleep(self.beat)
-            for k in list(self._held):
-                try:
-                    if not renew(k, owner=self.owner, ttl_seconds=self.ttl):
-                        self.lost = True
-                        log.error("deployment_lock_lost", resource_key=k)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("deployment_lock_renew_failed", error=type(exc).__name__)
+            self.check_once()
+
+    def check_once(self) -> None:
+        """One heartbeat round. A renewal that finds the lock gone, or errors for longer than the TTL, marks it lost."""
+        ok = True
+        for k in list(self._held):
+            try:
+                if not renew(k, owner=self.owner, ttl_seconds=self.ttl):
+                    self.lost = True
+                    ok = False
+                    log.error("deployment_lock_lost", resource_key=k)
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                log.warning("deployment_lock_renew_failed", error=type(exc).__name__)
+        if ok:
+            self._last_ok = time.monotonic()
+        elif time.monotonic() - self._last_ok >= self.ttl:
+            self.lost = True                # the TTL ran out without a renewal: another worker may own the lock now
 
     async def __aenter__(self) -> Self:
         self.acquire_all()

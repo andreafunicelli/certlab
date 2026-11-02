@@ -24,6 +24,19 @@ def _clean_locks(db):
         s.commit()
 
 
+@pytest.fixture(autouse=True)
+def _relax_chain_enforcement(db):
+    """Migration 0004 turns strict chain enforcement on for 'Production'; the throwaway test PKI is not trusted, so the
+    generic deploy tests run with it off (tests that exercise K8 switch it on for their own environment)."""
+    with SessionLocal() as s:
+        s.execute(text("UPDATE environments SET require_trusted_chain = false"))
+        s.commit()
+    yield
+    with SessionLocal() as s:
+        s.execute(text("UPDATE environments SET require_trusted_chain = (name = 'Production')"))
+        s.commit()
+
+
 @pytest.fixture
 def net(monkeypatch):
     n = FakeNetwork()

@@ -123,7 +123,7 @@ def test_self_approval_allowed_when_security_setting_enabled(login, db, net, pki
     assert admin.post(f"{API}/deployments/{job_id}/approve").json()["status"] == "pending"
 
 
-def test_list_get_events_cancel_retry_and_backups_api(login, db, world, operator):
+def test_list_get_events_cancel_retry_and_backups_api(login, db, world, operator, monkeypatch):
     server, fs, inst, version = world
     op, admin = login("operator"), login("admin")
     created = op.post(f"{API}/deployments", json=payload(version, inst), headers={"Idempotency-Key": "life-0001"}).json()
@@ -167,11 +167,21 @@ def test_list_get_events_cancel_retry_and_backups_api(login, db, world, operator
         assert any(n.endswith("privkey.pem") for n in tar.getnames())
     # manual rollback of the completed target, then restore of the backup again is idempotent
     old_fp = detail["targets"][0]["previous_fingerprint"]
+    sent = []
+    from app.services import deployments as deployments_service
+
+    monkeypatch.setattr(deployments_service, "dispatch_restore", lambda *a: sent.append(a))
     r = admin.post(f"{API}/deployments/{job_id}/targets/{t['id']}/rollback")
-    assert r.status_code == 200 and r.json()["ok"] and r.json()["target"]["status"] == "rolled_back"
+    assert r.status_code == 202 and r.json()["accepted"] and r.json()["restore_status"] == "in_progress"
+    engine.run_restore(sent[0][0], sent[0][1], sent[0][2], previous_restore_status=sent[0][3], permission=sent[0][4])
+    db.expire_all()
+    r = admin.get(f"{API}/deployments/{job_id}")
+    assert r.json()["targets"][0]["status"] == "rolled_back"
     assert fs.leaf_fp(inst.cert_path) == old_fp
     r = admin.post(f"{API}/backups/{bid}/restore")
-    assert r.status_code == 200 and r.json()["ok"]
+    assert r.status_code == 202 and r.json()["backup"]["restore_status"] == "in_progress"
+    engine.run_restore(sent[1][0], sent[1][1], sent[1][2], previous_restore_status=sent[1][3], permission=sent[1][4])
+    assert admin.get(f"{API}/backups/{bid}").json()["restore_status"] == "restored"
     # operators cannot roll back / restore
     assert op.post(f"{API}/backups/{bid}/restore").status_code == 403
 

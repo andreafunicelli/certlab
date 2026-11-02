@@ -174,17 +174,18 @@ def create_environment(db: Session, actor: User, data: EnvironmentCreate) -> Env
 def update_environment(db: Session, actor: User, env_id: uuid.UUID, data: EnvironmentUpdate) -> EnvironmentOut:
     e = _env(db, env_id)
     before = {"name": e.name, "is_production": e.is_production, "requires_approval": e.requires_approval,
-              "description": e.description}
+              "require_trusted_chain": e.require_trusted_chain, "description": e.description}
     if "name" in data.model_fields_set and data.name and data.name != e.name:
         if repo.get_environment_by_name(db, data.name):
             raise conflict("ENVIRONMENT_EXISTS", "An environment with this name already exists")
         e.name = data.name
-    for field in ("description", "is_production", "requires_approval"):
+    for field in ("description", "is_production", "requires_approval", "require_trusted_chain"):
         if field in data.model_fields_set and (field == "description" or getattr(data, field) is not None):
             setattr(e, field, getattr(data, field))
     audit.record(db, action="ENVIRONMENT_UPDATED", resource_type="environment", resource_id=e.id, actor=actor,
                  before=before, after={"name": e.name, "is_production": e.is_production,
-                                       "requires_approval": e.requires_approval, "description": e.description})
+                                       "requires_approval": e.requires_approval,
+                                       "require_trusted_chain": e.require_trusted_chain, "description": e.description})
     db.commit()
     return _env_out(db, e)
 

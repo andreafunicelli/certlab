@@ -110,7 +110,8 @@ def approve(deployment_id: uuid.UUID, ctx: AuthContext = Depends(require_permiss
 @router.post("/deployments/{deployment_id}/cancel")
 def cancel(deployment_id: uuid.UUID, ctx: AuthContext = Depends(require_permission("deployments:cancel")),
            db: Session = Depends(get_db)) -> dict[str, Any]:
-    return service.job_out(db, service.cancel(db, ctx.user, deployment_id), detail=True)
+    job = service.cancel(db, ctx.user, deployment_id)
+    return {**service.job_out(db, job, detail=True), "cancel": service.cancel_notice(db, job)}
 
 
 @router.post("/deployments/{deployment_id}/retry", status_code=201)
@@ -119,7 +120,7 @@ def retry(deployment_id: uuid.UUID, ctx: AuthContext = Depends(require_permissio
     return service.job_out(db, service.retry(db, ctx.user, deployment_id), detail=True)
 
 
-@router.post("/deployments/{deployment_id}/targets/{target_id}/rollback")
+@router.post("/deployments/{deployment_id}/targets/{target_id}/rollback", status_code=202)
 def rollback_target(deployment_id: uuid.UUID, target_id: uuid.UUID,
                     ctx: AuthContext = Depends(require_permission("deployments:rollback", reauth=True)),
                     db: Session = Depends(get_db)) -> dict[str, Any]:

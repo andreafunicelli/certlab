@@ -4,14 +4,15 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import String, cast, func, select
+from sqlalchemy import String, cast, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.errors import AppError, not_found
+from app.core.logging import get_logger
 from app.core.permissions import has_permission
 from app.models import (
     Backup,
@@ -24,13 +25,19 @@ from app.models import (
     User,
 )
 from app.models.base import utcnow
-from app.services import audit
+from app.services import audit, locks
 from app.services import deployment_engine as engine
 from app.services import deployment_planner as planner
 from app.services import settings as settings_service
 from app.services.events import register_kind
 
 TERMINAL = planner.FINAL_JOB_STATUSES
+log = get_logger(__name__)
+
+# K5: a deployment that stays ``pending`` this long after its last hand-over to the broker is re-dispatched, at most
+# MAX_DISPATCH_ATTEMPTS times in total, and failed with QUEUE_LOST afterwards.
+PENDING_REDISPATCH_MINUTES = 10
+MAX_DISPATCH_ATTEMPTS = 3
 
 
 # --------------------------------------------------------------------------- dispatch (monkeypatched in tests)
@@ -39,6 +46,45 @@ def dispatch(job_id: uuid.UUID) -> None:
     from app.workers.celery_app import enqueue
 
     enqueue("deployments.run", str(job_id))
+
+
+def dispatch_restore(backup_id: uuid.UUID, actor_id: uuid.UUID, target_id: uuid.UUID | None, previous_status: str,
+                     permission: str) -> None:
+    """Hand a manual restore / target rollback to a Celery worker (``backups.restore``)."""
+    from app.workers.celery_app import enqueue
+
+    enqueue("backups.restore", str(backup_id), str(actor_id), str(target_id) if target_id else None, previous_status, permission)
+
+
+def _fail_queue(db: Session, job: DeploymentJob, code: str, message: str, *, actor: User | None, action: str) -> None:
+    """The job can never reach a worker: finish it as failed so nothing waits for it forever."""
+    before = job.status
+    job.status, job.finished_at, job.error_summary = "failed", utcnow(), f"{code}: {message}"
+    for t in db.scalars(select(DeploymentTarget).where(DeploymentTarget.job_id == job.id)):
+        if t.status not in planner.FINAL_TARGET_STATUSES:
+            t.status, t.error_code, t.error_message = "cancelled", code, message
+    audit.record(db, action=action, resource_type="deployment", resource_id=job.id, actor=actor,
+                 actor_name=None if actor else "deployment-engine", before={"status": before},
+                 after={"status": "failed", "error_code": code}, outcome="failure", error=message)
+    db.commit()
+
+
+def _send(db: Session, job: DeploymentJob, actor: User) -> None:
+    """Dispatch a committed ``pending`` job. A broker failure fails the job (QUEUE_UNAVAILABLE) instead of leaving it
+    ``pending`` forever (K4). Bookkeeping is committed before the send so an eager/fast worker never races our transaction."""
+    job.dispatch_attempts = (job.dispatch_attempts or 0) + 1
+    job.last_dispatched_at = utcnow()
+    db.commit()
+    try:
+        dispatch(job.id)
+    except Exception as exc:
+        log.error("deployment_dispatch_failed", job_id=str(job.id), error=type(exc).__name__)
+        db.rollback()
+        job = get_job(db, job.id)
+        _fail_queue(db, job, "QUEUE_UNAVAILABLE", "the job queue is unavailable; the deployment was not started",
+                    actor=actor, action="DEPLOYMENT_QUEUE_FAILED")
+        raise AppError("QUEUE_UNAVAILABLE", "The job queue is unavailable; the deployment was not started. Try again shortly.",
+                       503, {"deployment_id": str(job.id)}) from exc
 
 
 # --------------------------------------------------------------------------- serialisation
@@ -227,7 +273,7 @@ def create(db: Session, actor: User, idempotency_key: str | None, body: dict[str
             return existing, False
         raise AppError("IDEMPOTENCY_KEY_CONFLICT", "This Idempotency-Key was already used with a different request", 409) from None
     if not approval and dispatch_now:
-        dispatch(job.id)
+        _send(db, job, actor)
     return job, True
 
 
@@ -246,8 +292,11 @@ def approve(db: Session, actor: User, job_id: uuid.UUID) -> DeploymentJob:
     audit.record(db, action="DEPLOYMENT_APPROVED", resource_type="deployment", resource_id=job.id, actor=actor,
                  before={"status": "awaiting_approval"}, after={"status": "pending", "self_approved": job.initiated_by == actor.id})
     db.commit()
-    dispatch(job.id)
+    _send(db, job, actor)
     return job
+
+
+MUTATING_TARGET_STATES = ("activating", "reloading", "verifying", "rolling_back")
 
 
 def cancel(db: Session, actor: User, job_id: uuid.UUID) -> DeploymentJob:
@@ -255,15 +304,76 @@ def cancel(db: Session, actor: User, job_id: uuid.UUID) -> DeploymentJob:
     if job.status in TERMINAL:
         raise AppError("INVALID_STATE", f"deployment already finished ({job.status})", 409)
     before = job.status
-    job.cancel_requested = True
-    if job.status == "awaiting_approval":
-        job.status, job.finished_at = "cancelled", utcnow()
+    cancelled_now = False
+    if job.status == "pending" and job.started_at is None:
+        # K5: not picked up by any worker yet -> cancel at once. Guarded UPDATE: a worker that starts at the same time wins
+        res = db.execute(update(DeploymentJob).where(DeploymentJob.id == job.id, DeploymentJob.status == "pending",
+                                                     DeploymentJob.started_at.is_(None))
+                         .values(status="cancelled", cancel_requested=True, finished_at=utcnow()))
+        cancelled_now = res.rowcount == 1
+        db.expire(job)
+    if cancelled_now:
         for t in db.scalars(select(DeploymentTarget).where(DeploymentTarget.job_id == job.id)):
-            t.status, t.error_code = "cancelled", "CANCELLED"
+            t.status, t.error_code, t.error_message = "cancelled", "CANCELLED", "cancelled before a worker started it"
+    else:
+        job.cancel_requested = True
+        if job.status == "awaiting_approval":
+            job.status, job.finished_at = "cancelled", utcnow()
+            for t in db.scalars(select(DeploymentTarget).where(DeploymentTarget.job_id == job.id)):
+                t.status, t.error_code = "cancelled", "CANCELLED"
     audit.record(db, action="DEPLOYMENT_CANCEL_REQUESTED", resource_type="deployment", resource_id=job.id, actor=actor,
                  before={"status": before}, after={"status": job.status, "cancel_requested": True})
     db.commit()
     return job
+
+
+def cancel_notice(db: Session, job: DeploymentJob) -> dict[str, Any]:
+    """What a cancel request actually did (K7): cancellation is only honoured before activation starts."""
+    if job.status == "cancelled":
+        return {"effect": "cancelled", "message": "The deployment was cancelled; nothing was changed on any host."}
+    active = db.scalar(select(func.count()).select_from(DeploymentTarget).where(
+        DeploymentTarget.job_id == job.id, DeploymentTarget.status.in_(MUTATING_TARGET_STATES))) or 0
+    if active:
+        return {"effect": "too_late", "targets_in_activation": active,
+                "message": (f"Cancellation was requested, but activation has already started on {active} target(s). Those cannot "
+                            "be cancelled safely: they run to completion or are rolled back automatically. Targets that have "
+                            "not started yet will be skipped.")}
+    return {"effect": "requested",
+            "message": ("Cancellation was requested. It is honoured before backup and before activation; once a target has "
+                        "started activating it can no longer be cancelled and finishes or rolls back.")}
+
+
+def sweep_stuck_pending(db: Session, *, older_than_minutes: int = PENDING_REDISPATCH_MINUTES,
+                        max_attempts: int = MAX_DISPATCH_ATTEMPTS, now: datetime | None = None) -> dict[str, list[str]]:
+    """Beat task body (K5): jobs that are approved and ``pending`` but were never started by a worker.
+
+    Re-dispatches them (at most ``max_attempts`` hand-overs in total, counted in ``dispatch_attempts``), then fails
+    them with QUEUE_LOST. A duplicate delivery is harmless: the job lock and the persisted state make runs idempotent.
+    """
+    now = now or utcnow()
+    cutoff = now - timedelta(minutes=older_than_minutes)
+    rows = list(db.scalars(select(DeploymentJob).where(
+        DeploymentJob.status == "pending", DeploymentJob.started_at.is_(None),
+        (DeploymentJob.approval_required.is_(False)) | (DeploymentJob.approved_by.is_not(None)),
+        func.coalesce(DeploymentJob.last_dispatched_at, DeploymentJob.created_at) < cutoff).limit(100)))
+    out: dict[str, list[str]] = {"redispatched": [], "failed": []}
+    for job in rows:
+        if (job.dispatch_attempts or 0) >= max_attempts:
+            _fail_queue(db, job, "QUEUE_LOST", f"the deployment was not picked up by a worker after {job.dispatch_attempts} "
+                        "dispatch attempts", actor=None, action="DEPLOYMENT_QUEUE_FAILED")
+            out["failed"].append(str(job.id))
+            continue
+        job.dispatch_attempts = (job.dispatch_attempts or 0) + 1
+        job.last_dispatched_at = now
+        audit.record(db, action="DEPLOYMENT_REDISPATCHED", resource_type="deployment", resource_id=job.id, actor_name="deployment-engine",
+                     after={"attempt": job.dispatch_attempts})
+        db.commit()
+        try:
+            dispatch(job.id)
+            out["redispatched"].append(str(job.id))
+        except Exception as exc:  # noqa: BLE001 - the next sweep tries again until the attempts are used up
+            log.error("deployment_redispatch_failed", job_id=str(job.id), error=type(exc).__name__)
+    return out
 
 
 def retry(db: Session, actor: User, job_id: uuid.UUID) -> DeploymentJob:
@@ -286,6 +396,47 @@ def retry(db: Session, actor: User, job_id: uuid.UUID) -> DeploymentJob:
     return new
 
 
+def queue_restore(db: Session, actor: User, backup: Backup, target: DeploymentTarget | None, *,
+                  permission: str = "backups:restore") -> dict[str, Any]:
+    """Queue a manual restore / manual target rollback for a worker. Permission and re-authentication were checked at
+    the API; the worker authorises again. Progress is shown by ``backup.restore_status`` (``in_progress`` ->
+    ``restored`` / ``failed``) and, for a target rollback, the target's status and ``current_step``."""
+    keys = engine.restore_lock_keys(db, backup)
+    held = locks.active_locks(keys)
+    if held:
+        raise AppError("LOCK_HELD", "Another deployment or restore holds a lock on this target; try again when it has finished",
+                       409, {"resource": held[0].resource_key.split(":", 1)[-1]})
+    # no "already queued" refusal: a lost message would block restores for good, and the file locks already
+    # serialise two restores of the same files (the routine is idempotent: files that match the backup are skipped)
+    prior = backup.restore_status if backup.restore_status != "in_progress" else "none"
+    backup.restore_status = "in_progress"
+    if target is not None:
+        target.current_step = "manual_rollback"
+    audit.record(db, action="DEPLOYMENT_MANUAL_ROLLBACK" if target is not None else "BACKUP_RESTORE_REQUESTED",
+                 resource_type="deployment_target" if target is not None else "backup",
+                 resource_id=target.id if target is not None else backup.id, actor=actor,
+                 after={"backup_id": str(backup.id), "queued": True})
+    db.commit()
+    try:
+        dispatch_restore(backup.id, actor.id, target.id if target is not None else None, prior, permission)
+    except Exception as exc:
+        log.error("restore_dispatch_failed", backup_id=str(backup.id), error=type(exc).__name__)
+        db.rollback()
+        backup = db.get(Backup, backup.id)
+        backup.restore_status = prior
+        if target is not None:
+            db.get(DeploymentTarget, target.id).current_step = None
+        audit.record(db, action="BACKUP_RESTORE_FAILED", resource_type="backup", resource_id=backup.id, actor=actor,
+                     after={"error_code": "QUEUE_UNAVAILABLE"}, outcome="failure", error="job queue unavailable")
+        db.commit()
+        raise AppError("QUEUE_UNAVAILABLE", "The job queue is unavailable; the restore was not started. Try again shortly.",
+                       503) from exc
+    db.expire_all()
+    return {"accepted": True, "backup_id": str(backup.id), "target_id": str(target.id) if target is not None else None,
+            "job_id": str(target.job_id) if target is not None else None, "restore_status": "in_progress",
+            "message": "The restore was queued. Follow backup.restore_status and the target status."}
+
+
 def rollback_target(db: Session, actor: User, job_id: uuid.UUID, target_id: uuid.UUID) -> dict[str, Any]:
     job = get_job(db, job_id)
     t = db.get(DeploymentTarget, target_id)
@@ -296,13 +447,9 @@ def rollback_target(db: Session, actor: User, job_id: uuid.UUID, target_id: uuid
     backup = db.get(Backup, t.backup_id) if t.backup_id else None
     if backup is None or not backup.verified:
         raise AppError("NO_BACKUP", "this target has no verified backup to restore", 409)
-    audit.record(db, action="DEPLOYMENT_MANUAL_ROLLBACK", resource_type="deployment_target", resource_id=t.id, actor=actor,
-                 after={"backup_id": str(backup.id)})
-    db.commit()
-    result = engine.restore_backup(db, backup, actor, target=t)
-    job.rollback_status = "rolled_back" if result["ok"] else "manual_intervention_required"
-    db.commit()
-    return {"ok": result["ok"], "result": result, "target": target_out(db, t)}
+    out = queue_restore(db, actor, backup, t, permission="deployments:rollback")
+    db.refresh(t)
+    return {**out, "target": target_out(db, t)}
 
 
 # --------------------------------------------------------------------------- queries

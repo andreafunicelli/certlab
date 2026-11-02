@@ -65,6 +65,8 @@ class DeploymentJob(IdMixin, TimestampMixin, Base):
     acknowledged_warnings: Mapped[list[Any]] = mapped_column(JSONB, server_default="[]", default=list)
     request_hash: Mapped[str | None] = mapped_column(String(64))   # idempotency: sha256 of the canonical request body
     retry_of: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("deployment_jobs.id", ondelete="SET NULL"))
+    dispatch_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_dispatched_at: Mapped[datetime | None]
 
     __table_args__ = (in_check("status", DEPLOYMENT_STATUSES, "status"),)
 

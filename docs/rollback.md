@@ -34,9 +34,12 @@ been changed.
 Not triggers:
 
 - **Cancellation** is not honoured after `before_activation` (see [deployment-engine.md](deployment-engine.md) section 14).
-- **Failures after verification** (`finalize`) are outside the rollback `try` block. The target becomes `failed` and the new
-  certificate stays in place (**Known issue**, deployment-engine K2).
+- **Failures after verification** (`cleanup`, `finalize`) do not trigger a rollback: the new files were verified. Finalize is
+  retried; if the database still refuses, the target is `completed` (files and endpoint verified) or
+  `manual_intervention_required` (**Fixed**, deployment-engine K2, section 12).
 - **Authorisation checks** run only at checkpoints before activation, so they cannot trigger a rollback.
+- **A lost lock** (`LOCK_LOST`, deployment-engine K6, fixed) stops the unit before its next change. After activation started,
+  the normal rollback runs.
 
 ---
 
@@ -219,16 +222,21 @@ curl -sS -X POST -b cookies.txt -H "X-CSRF-Token: <cdp_csrf value>" \
   https://console.example.com/api/v1/backups/<backup_id>/restore
 ```
 
-The response has `ok`, `result` (with `files`, `served`, `error_code`, `error`) and `backup`.
+Both answer **202 Accepted** at once and the work runs in the Celery task `backups.restore`. The response has `accepted`,
+`backup_id`, `target_id`, `job_id`, `restore_status: "in_progress"` and (for the backup endpoint) the `backup`. Follow progress with
+`GET /api/v1/backups/{id}` (`restore_status`: `in_progress`, then `restored` or `failed`) and `GET /api/v1/deployments/{job_id}`
+(the target is `rolled_back`, or `manual_intervention_required` with `error_code`). Permission and re-authentication are checked in
+the API; the worker authorises the user again (an `AUTHZ` outcome leaves everything unchanged). If a held lock makes the API
+refuse, you get 409 `LOCK_HELD`; a broker outage gives 503 `QUEUE_UNAVAILABLE`.
 
 ### Step 7. Check the outcome
 
-- On success, the response has `ok: true`. `result.served` lists each endpoint with `served_fingerprint`. The target is
+- On success, `restore_status` is `restored`. The audit event `BACKUP_RESTORED` lists the files; the served check compares each endpoint with `served_fingerprint`. The target is
   `rolled_back` (if it was in a rollback-eligible status), and the backup's `restore_status` is `restored`.
 - Repeat step 3 on the host. Confirm the served fingerprint equals the previous one.
 - Run discovery on the server (`POST /api/v1/servers/{id}/discover`). The installation's `drift_status` should be `in_sync`.
 
-If `ok` is `false`, read `result.error_code`:
+If the restore failed, read the target's `error_code` (or the `BACKUP_RESTORE_FAILED` audit event):
 
 | Code | Likely cause | Action |
 |---|---|---|
@@ -237,7 +245,7 @@ If `ok` is `false`, read `result.error_code`:
 | `RESTORE_RELOAD_FAILED`, or `COMMAND_FAILED` with the message "is not running" | Reload failed, or the service is not running. A stopped service is raised by the SSH layer as an error (`COMMAND_FAILED`), not as `RESTORE_RELOAD_FAILED`. | Start or restart the service manually. The manual path never restarts a stopped service (section 8). |
 | `RESTORE_VERIFY_FAILED` | Files do not match the manifest afterwards (content, mode, owner or symlink target). | Something is changing the files. Check for another automation tool, config management, or a manual edit. |
 | `RESTORE_SERVED_MISMATCH` | An endpoint serves a certificate other than the previous one. | Check SNI, the vhost selected for that name, a load balancer or cache in front of the server, or a second listener. |
-| `INTERNAL_ERROR` with "unexpected error (LockHeld)" | Another deployment or restore holds a lock on one of the same paths or on the service. | Wait for that job to finish, or for its lock to expire (120 seconds after its last heartbeat). Check `deployment_locks`. The target is set to `manual_intervention_required` by this path (**Known issue**, section 8). |
+| `LOCK_HELD` | Another deployment or restore holds a lock on one of the same paths or on the service. | Wait for that job to finish, or for its lock to expire (120 seconds after its last heartbeat). Check `deployment_locks`. Nothing was changed: target and backup keep their state (**Fixed**, K3). |
 
 A failed restore can be repeated. Files that already match the backup are skipped.
 
@@ -247,7 +255,7 @@ Do not edit the database by hand to clear a target's status. The engine's guards
 
 ## 7. The restore routines
 
-Both endpoints call `engine.restore_backup` (`restore_backup_async` in `deployment_engine.py`).
+Both endpoints queue the task `backups.restore`, which calls `engine.run_restore` and then `restore_backup_async` in `deployment_engine.py`.
 
 | | `POST /api/v1/backups/{id}/restore` | `POST /api/v1/deployments/{job}/targets/{target}/rollback` |
 |---|---|---|
@@ -268,9 +276,10 @@ The routine:
 6. Records the outcome in `restore_status` (`restored` or `failed`), the target status (`rolled_back` or
    `manual_intervention_required`), and the audit log (`BACKUP_RESTORED` or `BACKUP_RESTORE_FAILED`).
 
-**Synchronous.** The whole routine runs inside the HTTP request. The request blocks for the SSH work and for the endpoint
-probes. With several endpoints, the request can take many seconds. Whether a proxy or browser times out first is
-**(unverified)**.
+**Asynchronous (fixed).** The request only validates, checks the locks, sets `restore_status = in_progress` (and the target's
+`current_step = manual_rollback`), writes the audit event (`DEPLOYMENT_MANUAL_ROLLBACK` or `BACKUP_RESTORE_REQUESTED`) and queues
+the task. No second restore is refused while one is `in_progress`: a lost message would block restores for good, and the file
+locks serialise two restores of the same files.
 
 **Served check, a difference from automatic rollback (Known issue).** The manual routine accepts an endpoint that is not
 reachable. It only fails when the endpoint answers with a different fingerprint (`if got is not None and got != prev_fp`).
@@ -289,9 +298,9 @@ with `served_fingerprint: null` while the endpoint is down. Checked by reading t
   skipping files that already match the backup.
 - **The manual reload never restarts.** `restore_backup_async` calls `reload(host, False)`. A stopped service therefore fails
   the restore (`RESTORE_RELOAD_FAILED`) even when the automatic rollback would have restarted it.
-- **Synchronous HTTP work.** See section 7.
-- **Lock conflicts are misreported (Known issue K3).** `classify()` does not know `LockHeld`, so the failure is
-  `INTERNAL_ERROR`, and the target is marked `manual_intervention_required` by the manual routines.
+- **Synchronous HTTP work: fixed.** See section 7.
+- **Lock conflicts (K3): fixed.** `classify()` maps `LockHeld` to `LOCK_HELD`; the API answers 409 and the worker leaves the target
+  and backup unchanged.
 - **`chain_valid` is not checked** by rollback or by the manual routine. This matches the forward path.
 - **Restore does not re-run preflight.** It does not check current disk usage, locks held by other jobs (beyond the file and
   service locks it takes), or whether the service is currently healthy.
@@ -317,5 +326,19 @@ Unit tests (names read; not run): `test_rollback_failure_needs_manual_interventi
 rollback API, including the re-authentication and operator-denied cases, is in `test_list_get_events_cancel_retry_and_backups_api`
 in `test_deploy_api.py`. Backup creation, verification and restore are in `tests/unit/deploy/test_backups.py`.
 
-As far as the test names show, no test covers a manual restore that hits an endpoint which is down, a symlink changed
-after the backup, or the lock-conflict misclassification (K3).
+New unit tests in `test_d3_engine.py` cover the lock-held restore (K3), the queued restore and rollback, the worker's second
+authorisation, the finalize recovery paths (K2) and lost locks (K6). As far as the test names show, no test covers a manual
+restore that hits an endpoint which is down, or a symlink changed after the backup.
+
+---
+
+## 10. Known issues status
+
+| # | Issue | Status |
+|---|---|---|
+| K2 | Failure after verification marked the target `failed` with the new files in place. | **Fixed.** Retried finalize; `completed` or `manual_intervention_required` (deployment-engine section 12). |
+| K3 | A manual restore blocked by a lock was `INTERNAL_ERROR` and set `manual_intervention_required`. | **Fixed.** `LOCK_HELD`, 409 at the API, state unchanged. |
+| K6 | A lost lock did not stop the work. | **Fixed.** `LOCK_LOST` before the next mutating step; rollback if already activated. |
+| K7 | Cancellation is not honoured after activation starts. | **Kept** (it would leave mixed files). The cancel response says `too_late`. |
+| - | Manual restore and manual target rollback ran inside the HTTP request. | **Fixed.** 202 and Celery task `backups.restore`; the worker re-authorises. |
+| - | Manual served check accepts an unreachable endpoint (section 7). | Open, unchanged. |

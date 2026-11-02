@@ -144,6 +144,8 @@ def test_manual_restore_through_engine_restores_previous_certificate(db, net, pk
     from tests.unit.deploy.helpers import add_version
 
     monkeypatch.setattr(deployments, "dispatch", lambda j: None)
+    queued = []
+    monkeypatch.setattr(deployments, "dispatch_restore", lambda *a: queued.append(a))
     server = add_server(db, "m-srv")
     fs = net.add(server)
     inst = add_installation(db, server, fs, pkis["old"], name="man")
@@ -157,8 +159,16 @@ def test_manual_restore_through_engine_restores_previous_certificate(db, net, pk
     from app.models import DeploymentTarget
 
     t = db.scalar(select(DeploymentTarget).where(DeploymentTarget.job_id == job.id))
-    res = deployments.rollback_target(db, operator, job.id, t.id)
-    assert res["ok"] and res["target"]["status"] == "rolled_back"
+    from tests.conftest import make_user
+
+    admin = make_user(db, "restorer", "admin")
+    res = deployments.rollback_target(db, admin, job.id, t.id)
+    assert res["accepted"] and res["restore_status"] == "in_progress" and queued       # queued, not run in the request
+    args = queued[0]
+    assert engine.run_restore(args[0], args[1], args[2], previous_restore_status=args[3], permission=args[4])["ok"]
+    db.expire_all()
+    res = {"target": {"status": db.get(DeploymentTarget, t.id).status}}
+    assert res["target"]["status"] == "rolled_back"
     assert fs.leaf_fp(inst.cert_path) == old_fp and fs.served[(server.address, 8443)] == old_fp
     db.refresh(inst)
     assert inst.last_observed_fingerprint == old_fp

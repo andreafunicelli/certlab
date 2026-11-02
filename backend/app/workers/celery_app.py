@@ -61,6 +61,14 @@ def _setup_logging(**_: Any) -> None:  # use our JSON/redacting logging instead 
     configure_logging(_settings.log_level)
 
 
+@signals.worker_process_init.connect
+@signals.worker_ready.connect
+def _apply_ssh_limits(**_: Any) -> None:       # K10: the per-host SSH limit setting must reach every worker
+    from app.services import ssh_limits
+
+    ssh_limits.apply_from_db()
+
+
 def enqueue(task_name: str, *args: Any, countdown: float | None = None, **options: Any) -> None:
     """Send a task by name. Honors ``task_always_eager`` (tests): then it runs inline in this process."""
     if celery_app.conf.task_always_eager:

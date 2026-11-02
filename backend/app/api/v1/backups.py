@@ -11,7 +11,7 @@ from app.api.deps import require_permission
 from app.core.db import get_db
 from app.schemas.common import Page, PageParams
 from app.services import backups as service
-from app.services import deployment_engine as engine
+from app.services import deployments as deployments_service
 from app.services.auth import AuthContext
 
 router = APIRouter(tags=["backups"])
@@ -33,9 +33,11 @@ def get_backup(backup_id: uuid.UUID, _: AuthContext = Depends(require_permission
     return service.backup_out(db, service.get_backup(db, backup_id))
 
 
-@router.post("/backups/{backup_id}/restore")
+@router.post("/backups/{backup_id}/restore", status_code=202)
 def restore_backup(backup_id: uuid.UUID, ctx: AuthContext = Depends(require_permission("backups:restore", reauth=True)),
                    db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Queue the restore for a worker (202). Follow ``backup.restore_status`` (``in_progress`` -> ``restored``/``failed``)
+    and, when the backup belongs to a completed/failed target, that target's status."""
     backup = service.get_backup(db, backup_id)
     target = None
     if backup.deployment_target_id:
@@ -44,8 +46,8 @@ def restore_backup(backup_id: uuid.UUID, ctx: AuthContext = Depends(require_perm
         target = db.get(DeploymentTarget, backup.deployment_target_id)
         if target is not None and target.status not in ("completed", "manual_intervention_required", "failed"):
             target = None
-    result = engine.restore_backup(db, backup, ctx.user, target=target)
-    return {"ok": result["ok"], "result": result, "backup": service.backup_out(db, service.get_backup(db, backup_id))}
+    out = deployments_service.queue_restore(db, ctx.user, backup, target)
+    return {**out, "backup": service.backup_out(db, service.get_backup(db, backup_id))}
 
 
 @router.get("/backups/{backup_id}/download")

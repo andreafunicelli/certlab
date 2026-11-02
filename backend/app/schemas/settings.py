@@ -74,6 +74,7 @@ class SSHSettings(_Section):
     connect_timeout: int = Field(10, ge=1, le=120)
     command_timeout: int = Field(60, ge=1, le=3600)
     deployment_concurrency: int = Field(3, ge=1, le=50)
+    host_concurrency: int = Field(4, ge=1, le=50)   # concurrent SSH sessions per host:port (applied by services.ssh_limits)
     canary: bool = True
     failure_threshold: int = Field(1, ge=0, le=100)
     discovery_roots: list[str] = Field(

@@ -486,3 +486,45 @@ def test_l_multi_target_canary_failure_stops_further_activations(db, world, faul
     assert by[nginx.id].status == "rolled_back" and by[nginx.id].is_canary
     assert by[apache.id].status == "cancelled" and by[apache.id].error_code == "SKIPPED"
     assert _tree_hash() == before
+
+
+# --------------------------------------------------------------------------- (m) K1 wildcard-only names, (n) K3 lock-held restore
+def test_m_wildcard_only_server_names_deploy_and_verify_with_a_real_hostname(db, world, faults):
+    """K1: no verify_sni, a wildcard-only server_name and the composite vhost label: SNI must be a concrete name."""
+    server, op = world
+    inst = _nginx(db, server)
+    inst.vhost, inst.server_names, inst.verify_sni = "*.test.local:8443", ["*.test.local"], None
+    db.commit()
+    version, new_fp = _version(db, ["nginx.test.local", "*.test.local"])
+    job = _create(db, op, version, [inst])
+    assert engine.run_job(job.id) == "completed"
+    _, (t,) = _status(db, job)
+    [ep] = t.verification["endpoints"]
+    assert ep["sni"] == "nginx.test.local" and ep["hostname_matches"] is True
+    assert _served(8443, "nginx.test.local") == new_fp
+    from app.models import Backup
+
+    assert engine.restore_backup(db, db.get(Backup, t.backup_id), op)["ok"]       # target left on its original certificate
+
+
+def test_n_manual_restore_with_held_lock_reports_lock_held_and_changes_nothing(db, world, faults):
+    server, op = world
+    inst = _nginx(db, server)
+    version, _ = _version(db, ["nginx.test.local"])
+    job = _create(db, op, version, [inst])
+    assert engine.run_job(job.id) == "completed"
+    _, (t,) = _status(db, job)
+    from app.models import Backup
+
+    b = db.get(Backup, t.backup_id)
+    key = locks.file_key(server.id, b.manifest["files"][0]["realpath"])
+    assert locks.acquire(key, owner="other-restore")
+    try:
+        before = _tree_hash()
+        res = engine.restore_backup(db, b, op, target=t)
+        assert not res["ok"] and res["error_code"] == "LOCK_HELD" and _tree_hash() == before
+        db.expire_all()
+        assert db.get(DeploymentTarget, t.id).status == "completed" and db.get(Backup, b.id).restore_status == "none"
+    finally:
+        locks.release(key, owner="other-restore")
+    assert engine.restore_backup(db, db.get(Backup, b.id), op)["ok"]

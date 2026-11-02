@@ -15,7 +15,7 @@ import asyncio
 import hashlib
 import posixpath
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,11 +54,15 @@ from app.models import (
     CertificateVersion,
     DeploymentJob,
     DeploymentTarget,
+    Environment,
     Server,
 )
 from app.models.base import utcnow
 from app.services import locks
 from app.services import settings as settings_service
+from app.services import trust as trust_service
+from app.services.verify_sni import required_hostnames as _required_hostnames
+from app.services.verify_sni import resolve_verify_sni
 
 log = get_logger(__name__)
 
@@ -196,26 +200,19 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def verify_endpoints_for(inst: CertificateInstallation, server: Server) -> list[dict[str, Any]]:
+def verify_endpoints_for(inst: CertificateInstallation, server: Server,
+                         leaf_sans: Iterable[str] | None = None) -> list[dict[str, Any]]:
+    """Endpoint(s) probed to verify ``inst``. The SNI is always a real hostname or ``None`` (see ``verify_sni``)."""
     host = inst.verify_host or server.address or server.hostname
     port = inst.verify_port or inst.listen_port
     if not port:
         return []
-    sni = inst.verify_sni or inst.vhost
-    if not sni:
-        names = [n for n in (inst.server_names or []) if n and n != "_" and "*" not in n and not n.startswith("~")]
-        sni = names[0] if names else None
+    sni = resolve_verify_sni(inst.verify_sni, inst.server_names, leaf_sans)
     return [{"host": host, "port": int(port), "sni": sni}]
 
 
 def required_hostnames(inst: CertificateInstallation) -> list[str]:
-    names: list[str] = []
-    for n in list(inst.server_names or []) + [inst.vhost or "", inst.verify_sni or ""]:
-        if not n or n == "_" or n.startswith("~") or "*" in n or "$" in n:
-            continue
-        if n not in names:
-            names.append(n)
-    return names
+    return _required_hostnames(inst.server_names, inst.vhost, inst.verify_sni)
 
 
 # --------------------------------------------------------------------------- findings
@@ -290,7 +287,7 @@ async def _inspect_target(ctx: _Ctx, host: RemoteHost, inst: CertificateInstalla
     if inst.managed_by_certbot:
         add("CERTBOT_MANAGED", "blocking",
             "this installation is managed by certbot; automatic replacement is unsupported - "
-            "use a certbot deploy hook instead (see docs: 'certbot deploy hooks')")
+            "leave the certbot-managed paths alone and use a certbot deploy hook instead (see docs/deployment-engine.md, section 'Certbot policy', anchor #15-certbot-policy)")
         return t
     if inst.classification in ("unsupported", "unreadable", "error", "requires_mapping"):
         add("INSTALLATION_NOT_DEPLOYABLE", "blocking",
@@ -477,7 +474,7 @@ async def _inspect_target(ctx: _Ctx, host: RemoteHost, inst: CertificateInstalla
                      "certificate must be served again; otherwise the target is marked manual_intervention_required")
 
     # ----- verification endpoints
-    eps = verify_endpoints_for(inst, server)
+    eps = verify_endpoints_for(inst, server, art.leaf.sans)
     baseline: list[dict[str, Any]] = []
     if eps:
         from app.integrations.tls.probe import probe_endpoint
@@ -610,6 +607,20 @@ async def build_plan_async(
         raise AppError("INSTALLATION_NOT_FOUND", "one or more installations do not exist", 404, {"ids": missing})
     ordered_insts = [by_id[i] for i in dict.fromkeys(installation_ids)]
     servers = {s.id: s for s in db.scalars(select(Server).where(Server.id.in_({i.server_id for i in ordered_insts})))}
+
+    # ---- strict chain environments (K8): the bundle's chain must validate against the trust anchors
+    strict_envs = {e.name for e in db.scalars(select(Environment).where(
+        Environment.name.in_({s.environment for s in servers.values()}), Environment.require_trusted_chain.is_(True)))}
+    if strict_envs:
+        problems = trust_service.chain_trust_problems(db, art.leaf, art.chain, now=now)
+        if problems:
+            for i in ordered_insts:
+                if servers[i.server_id].environment in strict_envs:
+                    findings.append(finding(
+                        "CHAIN_UNTRUSTED", "blocking",
+                        f"environment '{servers[i.server_id].environment}' requires a trusted certificate chain, but "
+                        f"the chain does not validate against the trust anchors: {problems[0]}", i.id,
+                        environment=servers[i.server_id].environment, problems=problems))
 
     targets_by_inst: dict[uuid.UUID, dict[str, Any]] = {}
     probe_cache: dict = {}

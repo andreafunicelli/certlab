@@ -50,6 +50,7 @@ from app.models.base import utcnow
 from app.services import audit, events, inventory, notifications
 from app.services import settings as settings_service
 from app.services.inventory import DiscoveredInstallation
+from app.services.verify_sni import resolve_verify_sni
 
 log = get_logger(__name__)
 
@@ -144,9 +145,10 @@ class _Resolver:
             eps = []
         if eps:
             _, port, sni = eps[0]
-            d.verify_host, d.verify_port, d.verify_sni = self.endpoint_host, port, sni
+            d.verify_host, d.verify_port, d.verify_sni = self.endpoint_host, port, resolve_verify_sni(sni, names)
         elif d.listen_port:
             d.verify_host, d.verify_port = self.endpoint_host, d.listen_port
+            d.verify_sni = resolve_verify_sni(None, names)
 
         if ref.unresolved_expression:
             d.message = f"certificate path uses an unresolved expression ({ref.unresolved_expression[:80]}); not supported"

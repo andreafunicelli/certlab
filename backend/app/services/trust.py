@@ -46,3 +46,19 @@ def anchors_pem_for_probe(db: Session) -> bytes | None:
     system = "".join(ssl.DER_cert_to_PEM_cert(c.public_bytes(Encoding.DER))
                      for c in _system_anchors())
     return (system + "\n" + extra).encode()
+
+
+UNTRUSTED_CHAIN_CODES = frozenset({"CHAIN_UNTRUSTED", "CHAIN_INVALID"})
+
+
+def chain_trust_problems(db: Session, leaf, chain, *, now) -> list[str]:
+    """Messages explaining why the bundle's chain does not validate against the trust anchors (empty = trusted).
+
+    Used by strict-chain environments (``Environment.require_trusted_chain``, known issue K8).
+    """
+    from app.integrations.certificates import ValidationPolicy, validate_bundle
+    from app.integrations.contracts import ParsedBundle
+
+    bundle = ParsedBundle(leaf, tuple(chain), None, None, False, ())
+    findings = validate_bundle(bundle, now=now, trust_anchors=anchors(db), policy=ValidationPolicy(allow_self_signed=False))
+    return [f.message for f in findings if f.code in UNTRUSTED_CHAIN_CODES]

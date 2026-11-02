@@ -45,6 +45,7 @@ from app.models import (
     CertificateVersion,
     DeploymentJob,
     DeploymentTarget,
+    Environment,
     Server,
     User,
 )
@@ -60,6 +61,8 @@ FINAL_TARGET = planner.FINAL_TARGET_STATUSES
 MUTATING_STATES = frozenset({"activating", "reloading", "verifying", "rolling_back"})
 PRE_MUTATION_STATES = frozenset({"pending", "preflight", "backing_up", "staging", "validating"})
 ACTOR = "deployment-engine"
+FINALIZE_ATTEMPTS = 3
+FINALIZE_RETRY_DELAY = 0.5
 STATE_KEYS = ("stage_dir", "staged", "expected", "activated", "reload_started")
 
 # Test seam: replaced by tests to inject a fault-injecting host wrapper.
@@ -87,6 +90,8 @@ def classify(exc: BaseException) -> tuple[str, str]:
         return exc.code, exc.message
     if isinstance(exc, RemoteError):
         return exc.code.value, exc.message
+    if isinstance(exc, locks.LockHeld):
+        return "LOCK_HELD", f"another deployment or restore holds a lock on this target ({exc.resource_key.split(':', 1)[-1]})"
     return "INTERNAL_ERROR", f"unexpected error ({type(exc).__name__})"
 
 
@@ -131,6 +136,10 @@ class UnitRunner:
         self.steps: list[dict[str, Any]] = copy.deepcopy(self.primary.steps or [])
         self.state: dict[str, Any] = {k: copy.deepcopy(v) for k, v in (self.primary.meta or {}).items() if k in STATE_KEYS}
         self.anchors = (settings_service.get_section_data(self.db, "security").get("trust_anchors_pem") or "").encode() or None
+        self.locks: locks.LockSet | None = None
+        env = self.db.scalar(select(Environment).where(Environment.name == self.server.environment))
+        self.strict_chain = bool(env is not None and env.require_trusted_chain)      # K8
+        self.verification: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------ persistence helpers
     def _flush(self) -> None:
@@ -216,6 +225,12 @@ class UnitRunner:
             self.note(f"cancellation honoured at checkpoint '{name}'")
             raise Cancelled()
         self.authorize()
+        self.ensure_locks()
+
+    def ensure_locks(self) -> None:
+        """K6: a lost lock (heartbeat renewal failed) means another worker may now touch the same files."""
+        if self.locks is not None and self.locks.lost:
+            raise DeployError("LOCK_LOST", "a deployment lock was lost (heartbeat failed); stopping before the next change")
 
     def authorize(self) -> None:
         user = self.db.get(User, self.job.initiated_by) if self.job.initiated_by else None
@@ -276,6 +291,7 @@ class UnitRunner:
                                        target_id=self.primary.id)
                     try:
                         await stack.enter_async_context(ls)
+                        self.locks = ls
                     except locks.LockHeld as exc:
                         raise DeployError("LOCK_HELD", f"another deployment holds a lock on this target ({exc.resource_key.split(':', 1)[-1]})") from exc
                     st["detail"]["keys"] = len(ls.keys)
@@ -297,6 +313,13 @@ class UnitRunner:
                     return "manual_intervention_required"
                 # pre-mutation failure: nothing was changed on the host
                 await self._cleanup_stage()
+                if self.state.get("activated"):
+                    # files were replaced and neither verification nor rollback ran to a result: a human must look (K2)
+                    self.set_status("manual_intervention_required", None, error=(
+                        code, f"unexpected error after files were replaced: {msg}"))
+                    self._notify("rollback.failed", "critical", {"reason": code, "message": _clip(msg, 300)})
+                    self._after_final("manual_intervention_required")
+                    return "manual_intervention_required"
                 self.set_status("failed", None, error=(code, msg))
                 self._after_final("failed")
                 return "failed"
@@ -382,6 +405,7 @@ class UnitRunner:
                 async with self.step("activate") as st:
                     done = []
                     for f in specs:
+                        self.ensure_locks()
                         res = await host.install(self.state["staged"][f["dest_path"]], f["dest_path"], int(f["mode"]),
                                                  f["owner"], f["group"])
                         if res.sha256 != f["new_sha256"]:
@@ -396,6 +420,7 @@ class UnitRunner:
                     st["detail"][svc] = _clip(res.stdout or "", 300)
                     if res.exit_status != 0:
                         raise DeployError("CONFIG_TEST_FAILED", f"{svc} rejected the new configuration: {_clip(res.stdout or '', 300)}")
+            self.ensure_locks()
             async with self.step("reload", "reloading") as st:
                 self.state["reload_started"] = True
                 self._flush()
@@ -407,6 +432,7 @@ class UnitRunner:
             async with self.step("verify", "verifying") as st:
                 verification = await self._verify_new(specs, art)
                 st["detail"].update({"mode": verification["mode"]})
+                self.verification = verification
                 for t in self.targets:
                     t.verification = verification
         except Exception as exc:  # noqa: BLE001 - from here on files may have been replaced: roll back
@@ -451,6 +477,12 @@ class UnitRunner:
                                   f"{row['host']}:{row['port']} serves {row['served_fingerprint']} instead of the new certificate")
             elif row.get("sni") and row.get("hostname_matches") is False:
                 raise DeployError("VERIFY_HOSTNAME_MISMATCH", f"the served certificate does not cover {row['sni']}")
+        if self.strict_chain:
+            for row in rows:
+                if row.get("reachable") and row.get("chain_valid") is False:
+                    raise DeployError("VERIFY_CHAIN_UNTRUSTED",
+                                      f"{row['host']}:{row['port']} serves a certificate chain that does not validate against "
+                                      "the trust anchors, and this environment requires a trusted chain")
         if not rows:
             if not allow_file_only:
                 raise DeployError("VERIFY_NO_ENDPOINT", "no verification endpoint configured and file-only verification is not allowed")
@@ -467,31 +499,124 @@ class UnitRunner:
 
     # ------------------------------------------------------------------ success
     async def _complete(self, art: planner.ArtifactSet) -> str:
-        async with self.step("cleanup") as st:
-            await self._cleanup_stage()
-            st["detail"]["stage_dir_removed"] = True
-        async with self.step("finalize") as st:
-            cert = self._ensure_certificate(art)
-            now = utcnow()
+        """Success path after a verified deployment (K2).
+
+        Everything here runs after the new files were verified on the host, so a failure must never roll the target
+        into a state that hides that: cleanup is best effort, ``finalize`` is idempotent and retried, and if the
+        database still refuses, the verified outcome is persisted through a fresh session (``completed`` when the files
+        and the endpoint were verified, otherwise ``manual_intervention_required``).
+        """
+        self._persist_verification()
+        try:
+            async with self.step("cleanup") as st:
+                await self._cleanup_stage()
+                st["detail"]["stage_dir_removed"] = True
+        except Exception as exc:  # noqa: BLE001 - the stage directory is garbage, not state
+            self._recover_session()
+            log.warning("deployment_cleanup_failed", error=type(exc).__name__)
+        last: Exception | None = None
+        for attempt in range(1, FINALIZE_ATTEMPTS + 1):
+            try:
+                async with self.step("finalize") as st:
+                    self._finalize_records(art, st)
+                    st["detail"]["attempt"] = attempt
+                self.set_status("completed", None)
+                self._after_final("completed")
+                return "completed"
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                self._recover_session()
+                log.warning("deployment_finalize_failed", attempt=attempt, error=type(exc).__name__)
+                if attempt < FINALIZE_ATTEMPTS:
+                    await asyncio.sleep(FINALIZE_RETRY_DELAY)
+        return self._finalize_degraded(last)
+
+    def _recover_session(self) -> None:
+        """Drop a broken transaction and reload the rows this runner works on."""
+        with contextlib.suppress(Exception):
+            self.db.rollback()
+        with contextlib.suppress(Exception):
+            self.db.expire_all()
+
+    def _persist_verification(self) -> None:
+        """The verification result is the evidence for everything that follows: store it before anything else."""
+        if self.verification is None:
+            return
+        try:
             for t in self.targets:
-                inst = self.installs.get(t.id)
-                t.new_fingerprint = art.leaf.fingerprint_sha256
-                if inst is not None:
-                    inst.last_observed_fingerprint = art.leaf.fingerprint_sha256
-                    inst.last_observed_at = now
-                    inst.last_deployment_id = self.job_id
-                    inst.drift_status = "in_sync"
-                    inst.certificate_id = cert.id
-                    inst.last_verification = {"at": now.isoformat(), "ok": True, "source": "deployment",
-                                              "mode": (t.verification or {}).get("mode")}
-            version = self.db.get(CertificateVersion, self.job.version_id)
-            version.status = "deployed"
-            if version.certificate_id is None:
-                version.certificate_id = cert.id
-            st["detail"]["certificate_id"] = str(cert.id)
-        self.set_status("completed", None)
-        self._after_final("completed")
-        return "completed"
+                t.verification = self.verification
+            self._flush()
+        except Exception as exc:  # noqa: BLE001
+            self._recover_session()
+            log.warning("deployment_verification_persist_failed", error=type(exc).__name__)
+
+    def _verified_ok(self) -> bool:
+        """Files verified (``_verify_new`` raises otherwise) and the endpoint verified, or file-only verification was
+        explicitly allowed by the strategy."""
+        v = self.verification
+        if not v or not v.get("files"):
+            return False
+        if v.get("mode") == "live":
+            return True
+        return v.get("mode") == "file_only" and bool(self.strategy.get("allow_file_only_verification"))
+
+    def _finalize_records(self, art: planner.ArtifactSet, st: dict[str, Any]) -> None:
+        cert = self._ensure_certificate(art)
+        now = utcnow()
+        for t in self.targets:
+            inst = self.installs.get(t.id)
+            t.new_fingerprint = art.leaf.fingerprint_sha256
+            if self.verification is not None:
+                t.verification = self.verification
+            if inst is not None:
+                inst.last_observed_fingerprint = art.leaf.fingerprint_sha256
+                inst.last_observed_at = now
+                inst.last_deployment_id = self.job_id
+                inst.drift_status = "in_sync"
+                inst.certificate_id = cert.id
+                inst.last_verification = {"at": now.isoformat(), "ok": True, "source": "deployment",
+                                          "mode": (t.verification or {}).get("mode")}
+        version = self.db.get(CertificateVersion, self.job.version_id)
+        version.status = "deployed"
+        if version.certificate_id is None:
+            version.certificate_id = cert.id
+        st["detail"]["certificate_id"] = str(cert.id)
+
+    def _finalize_degraded(self, exc: Exception | None) -> str:
+        """The database refused ``finalize`` repeatedly. Persist the verified outcome through a fresh session."""
+        code, msg = classify(exc) if exc is not None else ("INTERNAL_ERROR", "finalize failed")
+        ok = self._verified_ok()
+        status = "completed" if ok else "manual_intervention_required"
+        text = ("the new certificate is deployed and verified on the host, but its records could not be finalised "
+                f"({code}); inventory will refresh on the next discovery" if ok else
+                f"the new files are in place but could not be recorded as verified ({code}: {msg}); check the host")
+        try:
+            with SessionLocal() as db:
+                for tid in self.target_ids:
+                    t = db.get(DeploymentTarget, tid)
+                    if t is None:
+                        continue
+                    before = t.status
+                    t.status, t.current_step = status, None
+                    t.verification = self.verification or t.verification
+                    t.new_fingerprint = (self.verification or {}).get("expected_fingerprint") or t.new_fingerprint
+                    if ok:
+                        t.error_code, t.error_message = None, None
+                    else:
+                        t.error_code, t.error_message = "FINALIZE_FAILED", _clip(str(redact(text)), 1000)
+                    t.log = [*(t.log or [])[-499:], {"ts": _now(), "level": "warning" if ok else "error", "message": _clip(text, 400)}]
+                    audit.record(db, action="DEPLOYMENT_TARGET_STATE", resource_type="deployment_target", resource_id=t.id,
+                                 actor_name=ACTOR, before={"status": before},
+                                 after={"status": status, "job_id": str(self.job_id), "degraded_finalize": True},
+                                 outcome="success" if ok else "failure")
+                db.commit()
+        except Exception as exc2:
+            log.critical("deployment_finalize_unrecoverable", error=type(exc2).__name__, target_id=str(self.primary.id))
+            raise
+        if not ok:
+            self._notify("rollback.failed", "critical", {"reason": "FINALIZE_FAILED", "message": _clip(text, 300)})
+        self._after_final(status)
+        return status
 
     def _ensure_certificate(self, art: planner.ArtifactSet) -> Certificate:
         fp = art.leaf.fingerprint_sha256
@@ -896,20 +1021,33 @@ async def run_job_async(job_id: uuid.UUID, host_factory: planner.HostFactory | N
 
 
 # =========================================================================== manual restore
+def restore_lock_keys(db: Session, backup: Backup) -> list[str]:
+    """Locks a restore of ``backup`` needs: every backed-up path and the service of the installation."""
+    inst = db.get(CertificateInstallation, backup.installation_id) if backup.installation_id else None
+    keys = [locks.file_key(backup.server_id, e["realpath"]) for e in backup.manifest["files"]]
+    if inst is not None:
+        keys.append(locks.service_key(backup.server_id, inst.service_type))
+    return keys
+
+
 async def restore_backup_async(db: Session, backup: Backup, actor: User, *, target: DeploymentTarget | None = None,
-                               host_factory: planner.HostFactory | None = None) -> dict[str, Any]:
+                               host_factory: planner.HostFactory | None = None,
+                               previous_restore_status: str | None = None) -> dict[str, Any]:
     """Restore a backup to its server (admin-triggered rollback of a completed target / backup restore).
 
     Same verified routine as the automatic rollback: restore changed files with original mode/owner, config test,
     reload, files must hash to the backup and the previous certificate must be served again.
+
+    A restore that cannot take its locks (``LOCK_HELD``, K3) changed nothing: the target and the backup keep their
+    previous state and the caller may simply try again.
     """
     factory = host_factory or HOST_FACTORY or planner.default_host_factory
     server = db.get(Server, backup.server_id)
     inst = db.get(CertificateInstallation, backup.installation_id) if backup.installation_id else None
     owner = f"restore:{uuid.uuid4()}"
-    keys = [locks.file_key(server.id, e["realpath"]) for e in backup.manifest["files"]]
-    if inst is not None:
-        keys.append(locks.service_key(server.id, inst.service_type))
+    keys = restore_lock_keys(db, backup)
+    prior_status = previous_restore_status or (backup.restore_status if backup.restore_status != "in_progress" else "none")
+    prior_step = target.current_step if target is not None else None
     prev_fp = None
     for e in backup.manifest["files"]:
         if inst is not None and e["path"] == (inst.cert_path or inst.fullchain_path):
@@ -936,7 +1074,12 @@ async def restore_backup_async(db: Session, backup: Backup, actor: User, *, targ
             if inst is not None and prev_fp:
                 from app.integrations.tls.probe import probe_endpoint
 
-                for ep in planner.verify_endpoints_for(inst, server):
+                prev_sans = ()
+                for e in backup.manifest["files"]:
+                    if e["path"] == (inst.cert_path or inst.fullchain_path):
+                        prev_certs = parse_pem_certificates(backups.load_file_content(e, db))
+                        prev_sans = prev_certs[0].sans if prev_certs else ()
+                for ep in planner.verify_endpoints_for(inst, server, prev_sans):
                     got = None
                     for _ in range(5):
                         res = await probe_endpoint(ep["host"], ep["port"], ep["sni"], 5.0)
@@ -952,10 +1095,24 @@ async def restore_backup_async(db: Session, backup: Backup, actor: User, *, targ
         code, msg = classify(exc)
         result.update({"error_code": code, "error": msg})
     now = utcnow()
+    if result.get("error_code") == "LOCK_HELD":
+        # nothing was touched: leave target and backup as they were
+        db.rollback()
+        backup = db.get(Backup, backup.id)
+        backup.restore_status = prior_status
+        if target is not None:
+            target = db.get(DeploymentTarget, target.id)
+            target.current_step = prior_step if prior_step != "manual_rollback" else None
+        audit.record(db, action="BACKUP_RESTORE_FAILED", resource_type="backup", resource_id=backup.id, actor=actor,
+                     after={"error_code": "LOCK_HELD", "target_id": str(target.id) if target else None},
+                     outcome="failure", error=result.get("error"))
+        db.commit()
+        return result
     backup.restore_status = "restored" if result["ok"] else "failed"
     backup.restored_at = now if result["ok"] else backup.restored_at
     if target is not None:
         target.rollback_attempts = (target.rollback_attempts or 0) + 1
+        target.current_step = None
         if result["ok"]:
             target.status, target.error_code, target.error_message = "rolled_back", "MANUAL_ROLLBACK", "restored from backup by an administrator"
         else:
@@ -974,3 +1131,43 @@ async def restore_backup_async(db: Session, backup: Backup, actor: User, *, targ
 def restore_backup(db: Session, backup: Backup, actor: User, **kw: Any) -> dict[str, Any]:
     return asyncio.run(restore_backup_async(db, backup, actor, **kw))
 
+
+def run_restore(backup_id: uuid.UUID, actor_id: uuid.UUID, target_id: uuid.UUID | None = None, *,
+                previous_restore_status: str | None = None, permission: str = "backups:restore") -> dict[str, Any]:
+    """Worker entry point of a queued manual restore / manual target rollback.
+
+    The API already checked permission and re-authentication; the worker authorises again because the request may have
+    waited in the queue (user disabled, role removed) and never trusts the message alone.
+    """
+    with SessionLocal() as db:
+        backup = db.get(Backup, backup_id)
+        if backup is None:
+            return {"ok": False, "error_code": "BACKUP_NOT_FOUND", "error": "backup not found"}
+        user = db.get(User, actor_id)
+        target = db.get(DeploymentTarget, target_id) if target_id else None
+        prior = previous_restore_status or "none"
+
+        def refuse(code: str, message: str) -> dict[str, Any]:
+            backup.restore_status = prior
+            if target is not None and target.current_step == "manual_rollback":
+                target.current_step = None
+            audit.record(db, action="BACKUP_RESTORE_FAILED", resource_type="backup", resource_id=backup.id, actor=user,
+                         actor_name=None if user else ACTOR, after={"error_code": code}, outcome="denied", error=message)
+            db.commit()
+            return {"backup_id": str(backup.id), "ok": False, "error_code": code, "error": message, "files": [], "served": []}
+
+        if user is None or not user.enabled:
+            return refuse("AUTHZ", "the requesting user no longer exists or is disabled")
+        try:
+            authorize(user, permission)
+        except AppError as exc:
+            return refuse("AUTHZ", exc.message)
+        if target is not None and target.status not in ("completed", "manual_intervention_required", "failed"):
+            return refuse("INVALID_STATE", f"target is {target.status}; only completed/failed targets can be rolled back manually")
+        result = restore_backup(db, backup, user, target=target, previous_restore_status=prior)
+        if target is not None:
+            job = db.get(DeploymentJob, target.job_id)
+            if job is not None and result.get("error_code") != "LOCK_HELD":
+                job.rollback_status = "rolled_back" if result["ok"] else "manual_intervention_required"
+                db.commit()
+        return result

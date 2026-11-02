@@ -76,4 +76,8 @@ def update_section(db: Session, actor: User, section: str, version: int, patch: 
                  before=before.data, after=validated)
     db.commit()
     db.expire_all()
+    if section == "ssh":                      # K10: per-host SSH limit takes effect in this process at once; workers re-read per task
+        from app.services import ssh_limits
+
+        ssh_limits.on_settings_changed(section, validated)
     return _out(repo.get(db, section))  # type: ignore[arg-type]

@@ -101,8 +101,8 @@ function EnvDialog({ env, onClose }: { env: Environment | null; onClose: () => v
             <span>
               Require a trusted certificate chain
               <span className="block text-[11.5px] text-muted-foreground">
-                Blocks deployments whose chain does not validate against the trust anchors, and fails
-                verification if the served chain is untrusted.
+                Blocks deployments whose chain does not validate against the trust anchors, and
+                fails verification if the served chain is untrusted.
               </span>
             </span>
             <Toggle

@@ -10,6 +10,7 @@ import httpx
 import pytest
 from sqlalchemy import select
 
+from app.core.errors import AppError
 from app.integrations.notify import ChannelError, Message, build_webhook_request, send_webhook, sign_body
 from app.models import Certificate, CertificateInstallation, NotificationDelivery, Server
 from app.models.base import utcnow
@@ -19,6 +20,13 @@ from app.services import notifications as svc
 from tests.conftest import make_user
 
 WEBHOOK = {"url": "https://hooks.example.com/cdp"}
+
+
+@pytest.mark.parametrize("value", [42, True, {"Production": True}, [{"name": "Production"}], ["Production", 42]])
+def test_invalid_environment_filter_is_rejected_before_saving(value):
+    with pytest.raises(AppError) as exc:
+        svc._check_rule("cert.expiring", {"environment": value})
+    assert exc.value.code == "INVALID_FILTER"
 
 
 @pytest.fixture

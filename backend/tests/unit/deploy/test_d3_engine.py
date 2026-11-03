@@ -393,19 +393,52 @@ def test_k6_lost_lock_before_activation_stops_without_touching_the_host(db, one,
     assert not any(c[0] == "install" for c in fs.calls)
 
 
-def test_k6_lost_lock_during_activation_rolls_back(db, net, pkis, operator, lock_sets):
+@pytest.mark.parametrize("lose_after", [1, 3])
+def test_k6_lost_lock_during_activation_or_rollback_stops_mutation(db, net, pkis, operator, lock_sets, lose_after):
     server = add_server(db, "k6-srv")
     fs = net.add(server)
     inst = add_installation(db, server, fs, pkis["old"], name="k6", names=["site.test.local"])
     version = add_version(db, pkis["new"])
     job = make_job(db, operator, version, [inst])
-    before = fs.snapshot()
-    fs.hooks["after_install"] = lambda dest, f: setattr(lock_sets[-1], "lost", True)       # lost after the first file
-    assert engine.run_job(job.id) == "rolled_back"
+    installed = []
+
+    def after_install(dest, f):
+        installed.append(dest)
+        if len(installed) == 2:
+            f.current_config_broken = True       # start rollback after both forward writes
+        if len(installed) == lose_after:
+            lock_sets[-1].lost = True
+
+    fs.hooks["after_install"] = after_install
+    assert engine.run_job(job.id) == "manual_intervention_required"
     t = target(db, job)
-    assert t.error_code == "LOCK_LOST" and fs.snapshot() == before
-    forward = [c[1] for c in fs.calls if c[0] == "install"]
-    assert set(forward) == {forward[0]} and inst.cert_path not in forward                    # 2nd file never written; 1st only restored
+    assert t.error_code == "LOCK_LOST"
+    assert len(installed) == lose_after
+    assert not any(c[0] == "reload" for c in fs.calls)
+
+
+def test_manual_restore_stops_when_a_lock_is_lost(db, one, operator, admin_user, lock_sets):
+    _job, t, backup, fs, _inst = _completed_target(db, one, operator)
+    fs.calls.clear()
+    fs.hooks["after_install"] = lambda dest, f: setattr(lock_sets[-1], "lost", True)
+    result = engine.restore_backup(db, backup, admin_user, target=t)
+    assert result["ok"] is False
+    assert len([c for c in fs.calls if c[0] == "install"]) == 1
+    assert not any(c[0] == "reload" for c in fs.calls)
+    assert target(db, _job).status == "manual_intervention_required"
+
+
+def test_manual_restore_fails_when_the_restored_endpoint_is_unreachable(db, one, operator, admin_user, monkeypatch):
+    job, t, backup, _fs, _inst = _completed_target(db, one, operator)
+
+    async def unreachable(host, port, sni, timeout, **kwargs):
+        return EndpointCertResult(host, port, sni, False, None, (), None, None, "connection refused", None)
+
+    monkeypatch.setattr("app.integrations.tls.probe.probe_endpoint", unreachable)
+    result = engine.restore_backup(db, backup, admin_user, target=t)
+    assert result["ok"] is False and result["error_code"] == "RESTORE_SERVED_MISMATCH"
+    assert target(db, job).status == "manual_intervention_required"
+    assert db.get(Backup, backup.id).restore_status == "failed"
 
 
 async def test_k6_heartbeat_marks_lock_lost_when_renewal_fails(db):
@@ -461,7 +494,8 @@ def test_k8_preflight_blocks_untrusted_chain_only_in_strict_environments(db, one
     assert ei.value.code == "PREFLIGHT_BLOCKED"
 
 
-def test_k8_trusted_chain_passes_preflight_and_verification_enforces_chain_valid(db, one, operator, admin_user, pkis, net, monkeypatch):
+@pytest.mark.parametrize("chain_valid", [False, None])
+def test_k8_trusted_chain_passes_preflight_and_verification_enforces_chain_valid(db, one, operator, admin_user, pkis, net, monkeypatch, chain_valid):
     _s, fs, inst, version = one
     _strict(db)
     _trust(db, admin_user, pkis["new"])
@@ -471,7 +505,7 @@ def test_k8_trusted_chain_passes_preflight_and_verification_enforces_chain_valid
 
     async def untrusted(host, port, sni, timeout, trust_anchors_pem=None, expected_hostname=None):
         r = await orig(host, port, sni, timeout, trust_anchors_pem, expected_hostname)
-        return EndpointCertResult(r.host, r.port, r.sni, r.ok, r.leaf, r.chain, False, r.hostname_matches, r.error, r.tls_version) \
+        return EndpointCertResult(r.host, r.port, r.sni, r.ok, r.leaf, r.chain, chain_valid, r.hostname_matches, r.error, r.tls_version) \
             if r.ok else r
 
     monkeypatch.setattr("app.integrations.tls.probe.probe_endpoint", untrusted)

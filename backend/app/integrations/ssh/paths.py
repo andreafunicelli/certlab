@@ -48,7 +48,7 @@ def validate_account(value: str) -> str:
 
 
 def mode_str(mode: int) -> str:
-    if not 0 <= mode <= 0o7777:
+    if not 0 <= mode <= 0o777:
         raise RemoteError(RemoteErrorCode.COMMAND_FAILED, "invalid mode")
     return format(mode, "04o")
 

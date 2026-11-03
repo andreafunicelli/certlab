@@ -40,7 +40,10 @@ def body_parser(model: type[BaseModel]) -> Callable:
                 content = await upload.read(MAX_BODY + 1)
                 if len(content) > MAX_BODY:
                     raise AppError("PAYLOAD_TOO_LARGE", "Key file too large", 413)
-                data["private_key"] = content.decode("utf-8", errors="strict")
+                try:
+                    data["private_key"] = content.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exc:
+                    raise AppError("VALIDATION_ERROR", "Key file must be UTF-8 text", 422) from exc
             if not data.get("passphrase"):
                 data.pop("passphrase", None)
         else:
@@ -50,8 +53,6 @@ def body_parser(model: type[BaseModel]) -> Callable:
         except ValidationError as exc:
             errs = [{"loc": [str(p) for p in e["loc"]], "msg": e["msg"]} for e in exc.errors()]
             raise AppError("VALIDATION_ERROR", "Request validation failed", 422, {"errors": errs}) from exc
-        except UnicodeDecodeError as exc:
-            raise AppError("VALIDATION_ERROR", "Key file must be UTF-8 text", 422) from exc
 
     return parse
 

@@ -83,6 +83,11 @@ class JobBusy(Exception):
     """Another live worker is running this job."""
 
 
+def _ensure_locks(held: locks.LockSet) -> None:
+    if held.lost:
+        raise DeployError("LOCK_LOST", "a deployment lock was lost (heartbeat failed); stopping before the next change")
+
+
 def classify(exc: BaseException) -> tuple[str, str]:
     if isinstance(exc, DeployError):
         return exc.code, exc.message
@@ -229,8 +234,8 @@ class UnitRunner:
 
     def ensure_locks(self) -> None:
         """K6: a lost lock (heartbeat renewal failed) means another worker may now touch the same files."""
-        if self.locks is not None and self.locks.lost:
-            raise DeployError("LOCK_LOST", "a deployment lock was lost (heartbeat failed); stopping before the next change")
+        if self.locks is not None:
+            _ensure_locks(self.locks)
 
     def authorize(self) -> None:
         user = self.db.get(User, self.job.initiated_by) if self.job.initiated_by else None
@@ -425,6 +430,7 @@ class UnitRunner:
                 self.state["reload_started"] = True
                 self._flush()
                 for svc in self.service_types():
+                    self.ensure_locks()
                     res = await get_adapter(svc).reload(host, bool(self.strategy.get("allow_restart")))
                     st["detail"][svc] = _clip(res.stdout or "", 300)
                     if res.exit_status != 0:
@@ -479,7 +485,7 @@ class UnitRunner:
                 raise DeployError("VERIFY_HOSTNAME_MISMATCH", f"the served certificate does not cover {row['sni']}")
         if self.strict_chain:
             for row in rows:
-                if row.get("reachable") and row.get("chain_valid") is False:
+                if row.get("reachable") and row.get("chain_valid") is not True:
                     raise DeployError("VERIFY_CHAIN_UNTRUSTED",
                                       f"{row['host']}:{row['port']} serves a certificate chain that does not validate against "
                                       "the trust anchors, and this environment requires a trusted chain")
@@ -650,20 +656,23 @@ class UnitRunner:
         self._notify("rollback.triggered", "warning", {"reason": reason.code, "message": reason.message})
         backup = self.db.get(Backup, self.primary.backup_id) if self.primary.backup_id else None
         try:
+            self.ensure_locks()
             if backup is None:
                 raise DeployError("ROLLBACK_NO_BACKUP", "no backup is recorded for this target")
             async with self.step("rollback") as st:
-                outcome = await backups.restore_files(self.db, host, backup)
+                outcome = await backups.restore_files(self.db, host, backup, before_change=self.ensure_locks)
                 st["detail"]["files"] = [{"path": r.path, "action": r.action, "detail": r.detail} for r in outcome.files]
                 if not outcome.ok:
                     raise DeployError("ROLLBACK_RESTORE_FAILED", outcome.error or "one or more files could not be restored: " + "; ".join(
                         f"{r.path}: {r.detail}" for r in outcome.files if r.action == "failed"))
                 for svc in self.service_types():
+                    self.ensure_locks()
                     res = await get_adapter(svc).config_test(host)
                     if res.exit_status != 0:
                         raise DeployError("ROLLBACK_CONFIG_TEST_FAILED", f"{svc} rejects the restored configuration: {_clip(res.stdout or '', 300)}")
                 if self.state.get("reload_started"):
                     for svc in self.service_types():
+                        self.ensure_locks()
                         res = await get_adapter(svc).reload(host, bool(self.strategy.get("allow_restart")))
                         if res.exit_status != 0:
                             raise DeployError("ROLLBACK_RELOAD_FAILED", f"{svc} reload after restore failed: {_clip(res.stdout or '', 300)}")
@@ -1057,15 +1066,17 @@ async def restore_backup_async(db: Session, backup: Backup, actor: User, *, targ
     db.commit()
     result: dict[str, Any] = {"backup_id": str(backup.id), "ok": False, "files": [], "served": []}
     try:
-        async with factory(server) as host, locks.LockSet(keys, owner=owner, job_id=None, target_id=None):
-            outcome = await backups.restore_files(db, host, backup)
+        async with factory(server) as host, locks.LockSet(keys, owner=owner, job_id=None, target_id=None) as held:
+            outcome = await backups.restore_files(db, host, backup, before_change=lambda: _ensure_locks(held))
             result["files"] = [{"path": r.path, "action": r.action, "detail": r.detail} for r in outcome.files]
             if not outcome.ok:
                 raise DeployError("RESTORE_FAILED", outcome.error or "files could not be restored")
             if inst is not None:
                 adapter = get_adapter(inst.service_type)
+                _ensure_locks(held)
                 if (await adapter.config_test(host)).exit_status != 0:
                     raise DeployError("RESTORE_CONFIG_TEST_FAILED", "the service rejects the restored configuration")
+                _ensure_locks(held)
                 if (await adapter.reload(host, False)).exit_status != 0:
                     raise DeployError("RESTORE_RELOAD_FAILED", "reload after restore failed")
             problems = await backups.verify_files_match(host, backup)
@@ -1087,7 +1098,7 @@ async def restore_backup_async(db: Session, backup: Backup, actor: User, *, targ
                         if got == prev_fp:
                             break
                         await asyncio.sleep(1)
-                    if got is not None and got != prev_fp:
+                    if got != prev_fp:
                         raise DeployError("RESTORE_SERVED_MISMATCH", f"{ep['host']}:{ep['port']} does not serve the restored certificate")
                     result["served"].append({**ep, "served_fingerprint": got})
         result["ok"] = True

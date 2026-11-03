@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import shlex
 import socket
+import subprocess
+from pathlib import Path
 
 import asyncssh
 import pytest
@@ -59,6 +61,22 @@ def test_mode_and_account():
     with pytest.raises(RemoteError):
         paths.validate_account("root; id")
     assert paths.validate_account("www-data") == "www-data"
+
+
+@pytest.mark.parametrize("mode", [0o4755, 0o2755, 0o1777, 0o4600])
+def test_client_rejects_special_permission_bits(mode):
+    with pytest.raises(RemoteError):
+        paths.mode_str(mode)
+
+
+@pytest.mark.parametrize("mode", ["4755", "2755", "1777", "4600", "0644", "600"])
+def test_privileged_helper_rejects_special_permission_bits(mode):
+    helper = Path(__file__).resolve().parents[4] / "infra/remote-helper/cdp-helper"
+    # Source the actual shell functions without executing the root-only dispatcher.
+    definitions = helper.read_text().split("# ----------------------------------------------------------------------------- main\n")[0]
+    result = subprocess.run(["sh", "-c", definitions + '\nvalid_mode "$1"', "cdp-helper", mode],
+                            check=False, capture_output=True, text=True)
+    assert result.returncode == (0 if mode in ("0644", "600") else 1), result.stderr
 
 
 # ---------------------------------------------------------------- error classification

@@ -27,7 +27,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.db import SessionLocal
@@ -64,6 +64,9 @@ ACTOR = "deployment-engine"
 FINALIZE_ATTEMPTS = 3
 FINALIZE_RETRY_DELAY = 0.5
 STATE_KEYS = ("stage_dir", "staged", "expected", "activated", "reload_started")
+RESTORABLE_TARGET_STATES = frozenset({"completed", "manual_intervention_required", "failed"})
+RESTORE_VERIFY_ATTEMPTS = 5
+RESTORE_VERIFY_DELAY = 1.0
 
 # Test seam: replaced by tests to inject a fault-injecting host wrapper.
 HOST_FACTORY: planner.HostFactory | None = None
@@ -127,8 +130,12 @@ def check_staged(art: planner.ArtifactSet, contents: dict[str, tuple[ArtifactKin
 class UnitRunner:
     """Runs one deployment unit: a primary target plus targets that share files with it (same server)."""
 
-    def __init__(self, job_id: uuid.UUID, target_ids: list[uuid.UUID], factory: planner.HostFactory, owner: str):
+    def __init__(self, job_id: uuid.UUID, target_ids: list[uuid.UUID], factory: planner.HostFactory, owner: str,
+                 revoked: dict[str, Any] | None = None):
         self.job_id, self.target_ids, self.factory, self.owner = job_id, target_ids, factory, owner
+        # Set when the initiating user lost the right to continue: the unit may only be brought back to its previous
+        # state (safety recovery) and never moves forward.
+        self.revoked = revoked
         self.db: Session = SessionLocal()
         self.job = self.db.get(DeploymentJob, job_id)
         self.targets = [self.db.get(DeploymentTarget, i) for i in target_ids]
@@ -283,7 +290,11 @@ class UnitRunner:
     async def _run(self) -> str:
         if self.primary.status in FINAL_TARGET:
             return self.primary.status
-        resume = self.primary.status in MUTATING_STATES
+        resume = self.primary.status in MUTATING_STATES or bool(self.revoked and self.state.get("activated"))
+        if self.revoked and not resume:
+            # never started mutating: nothing to recover, and a revoked user must not start it now
+            self.set_status("cancelled", None, error=("AUTHZ", self.revoked["message"]))
+            return "cancelled"
         stack = AsyncExitStack()
         try:
             try:
@@ -404,6 +415,8 @@ class UnitRunner:
     # ------------------------------------------------------------------ activation .. verification
     async def _activate_and_verify(self, specs: list[dict[str, Any]], art: planner.ArtifactSet, *, skip_install: bool) -> str:
         host = self.host
+        if self.revoked:
+            raise DeployError("AUTHZ_REVOKED", "the initiating user was revoked: the deployment must not continue forward")
         try:
             if not skip_install:
                 self.set_status("activating", "activate")
@@ -758,10 +771,50 @@ class UnitRunner:
             self._notify("rollback.failed", "critical", {"reason": "RECONCILE_FAILED", "classification": classification})
             self._after_final("manual_intervention_required")
             return "manual_intervention_required"
+        if self.revoked:
+            return await self._resume_revoked(status, classification)
         if status == "rolling_back" or classification != "all_new":
             return await self._rollback(DeployError("WORKER_INTERRUPTED",
                                                     f"worker was interrupted during '{status}' (files: {classification}); rolling back"))
         return await self._activate_and_verify(specs, art, skip_install=True)
+
+    async def _resume_revoked(self, status: str, classification: str) -> str:
+        """Safety recovery of an interrupted unit whose initiating user was revoked.
+
+        Authorization to *continue* is gone, the duty to leave the host in a known state is not. Whatever the
+        reconciliation found, the only allowed outcome is the previous state: restore from the verified backup (config
+        test, reload when a reload had started, previous fingerprint served again) or ``manual_intervention_required``.
+        Only a unit whose files provably equal the backup and that never replaced anything is simply cancelled.
+        """
+        rv = self.revoked or {}
+        who = rv.get("username") or str(rv.get("user_id"))
+        self.note(f"initiating user {who} is no longer authorised ({rv.get('message')}); recovering the previous state only",
+                  "warning")
+        if classification == "all_previous" and not self.state.get("activated") and status != "rolling_back":
+            await self._cleanup_stage()
+            self.set_status("cancelled", None, error=("AUTHZ", rv.get("message") or "initiating user revoked"))
+            self._record_revoked_recovery("cancelled", classification)
+            self._after_final("cancelled")
+            return "cancelled"
+        outcome = await self._rollback(DeployError(
+            "AUTHZ_REVOKED", f"the initiating user ({who}) is no longer authorised: {rv.get('message')}; the interrupted "
+            "deployment was not continued and the previous state was restored"))
+        self._record_revoked_recovery(outcome, classification)
+        return outcome
+
+    def _record_revoked_recovery(self, outcome: str, classification: str) -> None:
+        rv = self.revoked or {}
+        try:
+            audit.record(self.db, action="DEPLOYMENT_AUTHZ_REVOKED_RECOVERY", resource_type="deployment_target",
+                         resource_id=self.primary.id, actor_name=ACTOR,
+                         after={"job_id": str(self.job_id), "target_ids": [str(t.id) for t in self.targets],
+                                "revoked_user_id": str(rv.get("user_id")), "revoked_username": rv.get("username"),
+                                "reason": rv.get("message"), "classification": classification, "outcome": outcome},
+                         outcome="success" if outcome in ("rolled_back", "cancelled") else "failure")
+            self.db.commit()
+        except Exception as exc:  # noqa: BLE001 - the audit trail of the targets already carries the result
+            self.db.rollback()
+            log.warning("deployment_revoked_audit_failed", error=type(exc).__name__)
 
     # ------------------------------------------------------------------ helpers
     async def _cleanup_stage(self) -> None:
@@ -861,7 +914,7 @@ class JobRunner:
                     raise AppError("AUTHZ", "the initiating user no longer exists or is disabled", 403)
                 authorize(user, "deployments:create")
             except AppError as exc:
-                return self._abort(db, job, targets, "AUTHZ", exc.message)
+                return await self._authz_revoked(db, job, targets, user, exc.message)
             if job.started_at is None:
                 job.started_at = utcnow()
                 audit.record(db, action="DEPLOYMENT_STARTED", resource_type="deployment", resource_id=job.id,
@@ -930,6 +983,45 @@ class JobRunner:
             db.commit()
         self._publish("target.status", target_ids=[str(i) for i in unit.target_ids], status="cancelled",
                       error_code="SKIPPED", message=why)
+
+    # ------------------------------------------------------------------ revoked initiator
+    @staticmethod
+    def _may_have_mutated(t: DeploymentTarget) -> bool:
+        """True when the persisted state shows that files on the host may have been replaced."""
+        meta = t.meta or {}
+        return t.status in MUTATING_STATES or bool(meta.get("activated")) or bool(meta.get("reload_started"))
+
+    async def _authz_revoked(self, db: Session, job: DeploymentJob, targets: list[DeploymentTarget],
+                             user: User | None, message: str) -> str:
+        """The initiating user may no longer continue this job (disabled, deleted, role removed).
+
+        Authorization to continue and safety recovery are separate: targets that never started mutating are cancelled;
+        units that may have mutated are only brought back to their previous state (locks, reconcile, verified restore)
+        under the system actor, never moved forward.
+        """
+        units = self._units(targets)
+        by_id = {t.id: t for t in targets}
+        recover = [u for u in units if any(self._may_have_mutated(by_id[i]) for i in u.target_ids
+                                           if by_id[i].status not in FINAL_TARGET)]
+        if not recover:
+            return self._abort(db, job, targets, "AUTHZ", message)
+        recover_ids = {i for u in recover for i in u.target_ids}
+        for t in targets:
+            if t.status not in FINAL_TARGET and t.id not in recover_ids:
+                t.status, t.error_code, t.error_message = "cancelled", "AUTHZ", message
+                t.current_step = None
+        audit.record(db, action="DEPLOYMENT_AUTHZ_REVOKED", resource_type="deployment", resource_id=job.id, actor_name=ACTOR,
+                     after={"revoked_user_id": str(job.initiated_by) if job.initiated_by else None,
+                            "revoked_username": user.username if user else None, "reason": message,
+                            "recovering_targets": len(recover_ids)}, outcome="failure")
+        db.commit()
+        revoked = {"user_id": job.initiated_by, "username": user.username if user else None, "message": message}
+        for u in recover:
+            lock = self._server_locks.setdefault(u.server_id, asyncio.Lock())
+            async with lock:
+                await UnitRunner(self.job_id, u.target_ids, self.factory, self.owner, revoked=revoked).run()
+        db.expire_all()
+        return self._finalize(db, job)
 
     # ------------------------------------------------------------------ preflight
     def _abort(self, db: Session, job: DeploymentJob, targets: list[DeploymentTarget], code: str, message: str) -> str:
@@ -1030,13 +1122,82 @@ async def run_job_async(job_id: uuid.UUID, host_factory: planner.HostFactory | N
 
 
 # =========================================================================== manual restore
-def restore_lock_keys(db: Session, backup: Backup) -> list[str]:
-    """Locks a restore of ``backup`` needs: every backed-up path and the service of the installation."""
-    inst = db.get(CertificateInstallation, backup.installation_id) if backup.installation_id else None
+@dataclass
+class RestoreScope:
+    """Everything a manual restore of one backup touches: the backup is attached to every target of a shared unit and
+    restores the whole manifest, so all of their installations / services / endpoints are one unit."""
+    targets: list[DeploymentTarget]
+    installs: list[CertificateInstallation]
+
+    def service_types(self) -> list[str]:
+        return sorted({i.service_type for i in self.installs})
+
+
+def resolve_restore_scope(db: Session, backup: Backup, target: DeploymentTarget | None = None) -> RestoreScope:
+    """All targets / installations associated with ``backup``.
+
+    Deployment backups: every target carrying this ``backup_id`` (a unit shares one backup) plus the target the backup
+    was taken for and the one requested. Backups not tied to a deployment: every installation on the server whose
+    cert / key / chain / fullchain path (or its realpath) appears in the manifest.
+    """
+    cond = [DeploymentTarget.backup_id == backup.id]
+    if backup.deployment_target_id:
+        cond.append(DeploymentTarget.id == backup.deployment_target_id)
+    found = list(db.scalars(select(DeploymentTarget).where(or_(*cond))
+                            .order_by(DeploymentTarget.created_at, DeploymentTarget.id)))
+    targets: dict[uuid.UUID, DeploymentTarget] = {t.id: t for t in found}
+    if target is not None:
+        targets.setdefault(target.id, target)
+    installs: dict[uuid.UUID, CertificateInstallation] = {}
+
+    def add(inst: CertificateInstallation | None) -> None:
+        if inst is not None:
+            installs.setdefault(inst.id, inst)
+
+    if backup.installation_id:
+        add(db.get(CertificateInstallation, backup.installation_id))
+    for t in targets.values():
+        if t.installation_id:
+            add(db.get(CertificateInstallation, t.installation_id))
+    if backup.deployment_target_id is None:
+        paths = {e.get(k) for e in backup.manifest["files"] for k in ("path", "realpath")} - {None}
+        for inst in db.scalars(select(CertificateInstallation).where(CertificateInstallation.server_id == backup.server_id)):
+            if paths & {inst.cert_path, inst.key_path, inst.chain_path, inst.fullchain_path}:
+                add(inst)
+    return RestoreScope(list(targets.values()), list(installs.values()))
+
+
+def restore_lock_keys(db: Session, backup: Backup, target: DeploymentTarget | None = None,
+                      scope: RestoreScope | None = None) -> list[str]:
+    """Locks a restore of ``backup`` needs: every backed-up path and the service of EVERY affected installation."""
+    scope = scope or resolve_restore_scope(db, backup, target)
     keys = [locks.file_key(backup.server_id, e["realpath"]) for e in backup.manifest["files"]]
-    if inst is not None:
-        keys.append(locks.service_key(backup.server_id, inst.service_type))
+    keys += [locks.service_key(backup.server_id, svc) for svc in scope.service_types()]
     return keys
+
+
+def _previous_leaf(db: Session, backup: Backup, inst: CertificateInstallation):
+    """Leaf certificate the backup holds for ``inst`` (None when its certificate file is not part of the backup)."""
+    want = inst.cert_path or inst.fullchain_path
+    for e in backup.manifest["files"]:
+        if want and want in (e["path"], e.get("realpath")):
+            certs = parse_pem_certificates(backups.load_file_content(e, db))
+            return certs[0] if certs else None
+    return None
+
+
+def _restore_reloads(scope: RestoreScope) -> bool:
+    """Mirror of the engine's rule: services are reloaded after a restore only when a reload had started (or the
+    deployment completed / the backup is restored on its own); before that they never served the new files."""
+    if not scope.targets:
+        return True
+    return any(t.status == "completed" or (t.meta or {}).get("reload_started") for t in scope.targets)
+
+
+def manual_restore_targets(scope: RestoreScope, target: DeploymentTarget | None) -> list[DeploymentTarget]:
+    """Targets whose status a manual restore updates: the requested one and every other target of the unit that
+    is in a restorable state."""
+    return [t for t in scope.targets if (target is not None and t.id == target.id) or t.status in RESTORABLE_TARGET_STATES]
 
 
 async def restore_backup_async(db: Session, backup: Backup, actor: User, *, target: DeploymentTarget | None = None,
@@ -1044,76 +1205,97 @@ async def restore_backup_async(db: Session, backup: Backup, actor: User, *, targ
                                previous_restore_status: str | None = None) -> dict[str, Any]:
     """Restore a backup to its server (admin-triggered rollback of a completed target / backup restore).
 
-    Same verified routine as the automatic rollback: restore changed files with original mode/owner, config test,
-    reload, files must hash to the backup and the previous certificate must be served again.
+    Same verified routine as the automatic rollback, applied to the whole unit the backup belongs to: the locks of
+    every affected service and path are taken, the files are restored once, every affected service type is config
+    tested and (see :func:`_restore_reloads`) reloaded, every affected endpoint must serve the previous certificate
+    again, and only then are the inventory and the status of every affected target / installation updated. Any
+    failure leaves ALL affected targets in ``manual_intervention_required`` with the failing service named.
 
-    A restore that cannot take its locks (``LOCK_HELD``, K3) changed nothing: the target and the backup keep their
+    A restore that cannot take its locks (``LOCK_HELD``, K3) changed nothing: the targets and the backup keep their
     previous state and the caller may simply try again.
     """
     factory = host_factory or HOST_FACTORY or planner.default_host_factory
     server = db.get(Server, backup.server_id)
-    inst = db.get(CertificateInstallation, backup.installation_id) if backup.installation_id else None
+    scope = resolve_restore_scope(db, backup, target)
     owner = f"restore:{uuid.uuid4()}"
-    keys = restore_lock_keys(db, backup)
+    keys = restore_lock_keys(db, backup, target, scope)
     prior_status = previous_restore_status or (backup.restore_status if backup.restore_status != "in_progress" else "none")
-    prior_step = target.current_step if target is not None else None
-    prev_fp = None
-    for e in backup.manifest["files"]:
-        if inst is not None and e["path"] == (inst.cert_path or inst.fullchain_path):
-            certs = parse_pem_certificates(backups.load_file_content(e, db))
-            prev_fp = certs[0].fingerprint_sha256 if certs else None
+    affected = manual_restore_targets(scope, target)
+    affected_ids = [t.id for t in affected]
+    prior_steps = {t.id: t.current_step for t in affected}
+    previous: dict[uuid.UUID, Any] = {}
+    for inst in scope.installs:
+        try:
+            previous[inst.id] = _previous_leaf(db, backup, inst)
+        except Exception:  # noqa: BLE001 - an unreadable backup is reported by restore_files below
+            previous[inst.id] = None
+    services = scope.service_types()
+    do_reload = _restore_reloads(scope)
     backup.restore_status = "in_progress"
     db.commit()
-    result: dict[str, Any] = {"backup_id": str(backup.id), "ok": False, "files": [], "served": []}
+    result: dict[str, Any] = {"backup_id": str(backup.id), "ok": False, "files": [], "served": [],
+                              "services": services, "target_ids": [str(i) for i in affected_ids],
+                              "installation_ids": [str(i.id) for i in scope.installs]}
     try:
         async with factory(server) as host, locks.LockSet(keys, owner=owner, job_id=None, target_id=None) as held:
             outcome = await backups.restore_files(db, host, backup, before_change=lambda: _ensure_locks(held))
             result["files"] = [{"path": r.path, "action": r.action, "detail": r.detail} for r in outcome.files]
             if not outcome.ok:
                 raise DeployError("RESTORE_FAILED", outcome.error or "files could not be restored")
-            if inst is not None:
-                adapter = get_adapter(inst.service_type)
+            for svc in services:
                 _ensure_locks(held)
-                if (await adapter.config_test(host)).exit_status != 0:
-                    raise DeployError("RESTORE_CONFIG_TEST_FAILED", "the service rejects the restored configuration")
-                _ensure_locks(held)
-                if (await adapter.reload(host, False)).exit_status != 0:
-                    raise DeployError("RESTORE_RELOAD_FAILED", "reload after restore failed")
+                if (await get_adapter(svc).config_test(host)).exit_status != 0:
+                    result["failed_service"] = svc
+                    raise DeployError("RESTORE_CONFIG_TEST_FAILED", f"{svc} rejects the restored configuration")
+            if do_reload:
+                for svc in services:
+                    _ensure_locks(held)
+                    if (await get_adapter(svc).reload(host, False)).exit_status != 0:
+                        result["failed_service"] = svc
+                        raise DeployError("RESTORE_RELOAD_FAILED", f"{svc} reload after restore failed")
             problems = await backups.verify_files_match(host, backup)
             if problems:
                 raise DeployError("RESTORE_VERIFY_FAILED", "; ".join(problems))
-            if inst is not None and prev_fp:
-                from app.integrations.tls.probe import probe_endpoint
+            from app.integrations.tls.probe import probe_endpoint
 
-                prev_sans = ()
-                for e in backup.manifest["files"]:
-                    if e["path"] == (inst.cert_path or inst.fullchain_path):
-                        prev_certs = parse_pem_certificates(backups.load_file_content(e, db))
-                        prev_sans = prev_certs[0].sans if prev_certs else ()
-                for ep in planner.verify_endpoints_for(inst, server, prev_sans):
+            mismatches: list[str] = []
+            failed_services: list[str] = []
+            for inst in scope.installs:
+                leaf = previous.get(inst.id)
+                if leaf is None:
+                    continue
+                for ep in planner.verify_endpoints_for(inst, server, leaf.sans):
                     got = None
-                    for _ in range(5):
+                    for attempt in range(RESTORE_VERIFY_ATTEMPTS):
                         res = await probe_endpoint(ep["host"], ep["port"], ep["sni"], 5.0)
                         got = res.leaf.fingerprint_sha256 if res.ok and res.leaf else None
-                        if got == prev_fp:
+                        if got == leaf.fingerprint_sha256:            # a positive match is required
                             break
-                        await asyncio.sleep(1)
-                    if got != prev_fp:
-                        raise DeployError("RESTORE_SERVED_MISMATCH", f"{ep['host']}:{ep['port']} does not serve the restored certificate")
-                    result["served"].append({**ep, "served_fingerprint": got})
+                        if attempt + 1 < RESTORE_VERIFY_ATTEMPTS:
+                            await asyncio.sleep(RESTORE_VERIFY_DELAY)
+                    if got != leaf.fingerprint_sha256:
+                        mismatches.append(f"{inst.service_type} {ep['host']}:{ep['port']} does not serve the restored certificate")
+                        if inst.service_type not in failed_services:
+                            failed_services.append(inst.service_type)
+                        continue
+                    result["served"].append({**ep, "service_type": inst.service_type, "served_fingerprint": got})
+            if mismatches:
+                result["failed_service"] = ", ".join(failed_services)
+                raise DeployError("RESTORE_SERVED_MISMATCH", "; ".join(mismatches))
         result["ok"] = True
     except Exception as exc:  # noqa: BLE001
         code, msg = classify(exc)
         result.update({"error_code": code, "error": msg})
     now = utcnow()
     if result.get("error_code") == "LOCK_HELD":
-        # nothing was touched: leave target and backup as they were
+        # nothing was touched: leave targets and backup as they were
         db.rollback()
         backup = db.get(Backup, backup.id)
         backup.restore_status = prior_status
-        if target is not None:
-            target = db.get(DeploymentTarget, target.id)
-            target.current_step = prior_step if prior_step != "manual_rollback" else None
+        for tid in affected_ids:
+            t = db.get(DeploymentTarget, tid)
+            if t is not None and t.current_step == "manual_rollback":
+                t.current_step = prior_steps.get(tid) if prior_steps.get(tid) != "manual_rollback" else None
         audit.record(db, action="BACKUP_RESTORE_FAILED", resource_type="backup", resource_id=backup.id, actor=actor,
                      after={"error_code": "LOCK_HELD", "target_id": str(target.id) if target else None},
                      outcome="failure", error=result.get("error"))
@@ -1121,19 +1303,35 @@ async def restore_backup_async(db: Session, backup: Backup, actor: User, *, targ
         return result
     backup.restore_status = "restored" if result["ok"] else "failed"
     backup.restored_at = now if result["ok"] else backup.restored_at
-    if target is not None:
-        target.rollback_attempts = (target.rollback_attempts or 0) + 1
-        target.current_step = None
+    failure_text = None
+    if not result["ok"]:
+        failure_text = _clip(str(redact(
+            f"restore of the shared unit failed ({', '.join(services) or 'no service'}"
+            + (f"; failing service: {result['failed_service']}" if result.get("failed_service") else "")
+            + f"): {result.get('error', '')}")), 1000)
+    for t in affected:
+        t.rollback_attempts = (t.rollback_attempts or 0) + 1
+        t.current_step = None
         if result["ok"]:
-            target.status, target.error_code, target.error_message = "rolled_back", "MANUAL_ROLLBACK", "restored from backup by an administrator"
+            t.status, t.error_code, t.error_message = "rolled_back", "MANUAL_ROLLBACK", "restored from backup by an administrator"
+            if len(scope.targets) > 1:
+                t.error_message += " (together with the other targets sharing this backup)"
         else:
-            target.status, target.error_code = "manual_intervention_required", result.get("error_code")
-            target.error_message = _clip(str(redact(result.get("error", ""))), 1000)
-    if result["ok"] and inst is not None and prev_fp:
-        inst.last_observed_fingerprint, inst.last_observed_at, inst.drift_status = prev_fp, now, "in_sync"
+            t.status, t.error_code, t.error_message = "manual_intervention_required", result.get("error_code"), failure_text
+    if result["ok"]:
+        for inst in scope.installs:
+            leaf = previous.get(inst.id)
+            if leaf is not None:
+                inst.last_observed_fingerprint, inst.last_observed_at, inst.drift_status = leaf.fingerprint_sha256, now, "in_sync"
+    jobs = {t.job_id for t in affected}
+    result["job_ids"] = [str(j) for j in jobs]
     audit.record(db, action="BACKUP_RESTORED" if result["ok"] else "BACKUP_RESTORE_FAILED", resource_type="backup",
-                 resource_id=backup.id, actor=actor, after={"files": result["files"], "target_id": str(target.id) if target else None,
-                                                           **({"error_code": result.get("error_code")} if not result["ok"] else {})},
+                 resource_id=backup.id, actor=actor,
+                 after={"files": result["files"], "target_id": str(target.id) if target else None,
+                        "target_ids": result["target_ids"], "installation_ids": result["installation_ids"],
+                        "services": services,
+                        **({"error_code": result.get("error_code"), "failed_service": result.get("failed_service")}
+                           if not result["ok"] else {})},
                  outcome="success" if result["ok"] else "failure", error=result.get("error"))
     db.commit()
     return result
@@ -1160,8 +1358,9 @@ def run_restore(backup_id: uuid.UUID, actor_id: uuid.UUID, target_id: uuid.UUID 
 
         def refuse(code: str, message: str) -> dict[str, Any]:
             backup.restore_status = prior
-            if target is not None and target.current_step == "manual_rollback":
-                target.current_step = None
+            for t in resolve_restore_scope(db, backup, target).targets:
+                if t.current_step == "manual_rollback":
+                    t.current_step = None
             audit.record(db, action="BACKUP_RESTORE_FAILED", resource_type="backup", resource_id=backup.id, actor=user,
                          actor_name=None if user else ACTOR, after={"error_code": code}, outcome="denied", error=message)
             db.commit()
@@ -1176,9 +1375,11 @@ def run_restore(backup_id: uuid.UUID, actor_id: uuid.UUID, target_id: uuid.UUID 
         if target is not None and target.status not in ("completed", "manual_intervention_required", "failed"):
             return refuse("INVALID_STATE", f"target is {target.status}; only completed/failed targets can be rolled back manually")
         result = restore_backup(db, backup, user, target=target, previous_restore_status=prior)
-        if target is not None:
-            job = db.get(DeploymentJob, target.job_id)
-            if job is not None and result.get("error_code") != "LOCK_HELD":
-                job.rollback_status = "rolled_back" if result["ok"] else "manual_intervention_required"
-                db.commit()
+        if result.get("error_code") != "LOCK_HELD":
+            job_ids = {uuid.UUID(j) for j in result.get("job_ids", [])} | ({target.job_id} if target is not None else set())
+            for job_id in job_ids:
+                job = db.get(DeploymentJob, job_id)
+                if job is not None:
+                    job.rollback_status = "rolled_back" if result["ok"] else "manual_intervention_required"
+            db.commit()
         return result

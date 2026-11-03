@@ -263,28 +263,41 @@ Both endpoints queue the task `backups.restore`, which calls `engine.run_restore
 | Target | Optional. Attached if the backup belongs to a target in `completed`, `manual_intervention_required` or `failed`. | Required. Must belong to the job. |
 | Allowed states | Any backup. | Target `completed`, `failed` or `manual_intervention_required`. Backup must be `verified`, otherwise `NO_BACKUP`. |
 | Side effects | `backup.restore_status`, `restored_at`. On success, the target becomes `rolled_back` (only if attached) and the installation's fingerprint resets. | Same, always has a target. The job's `rollback_status` is set. Audit `DEPLOYMENT_MANUAL_ROLLBACK`. |
-| Locks | File locks for each backed-up path, plus the service lock. | Same. |
-| Served check | Only if the installation is known and the previous certificate can be read from the backup. | Same. |
+| Locks | File locks for each backed-up path, plus the service lock of **every** affected installation. | Same. |
+| Served check | Every affected installation whose previous certificate can be read from the backup. | Same. |
+| Scope | The whole unit (see "Shared backups" below). | Same: rolling back one target of a shared unit rolls back the whole unit. |
 
 The routine:
 
-1. Takes the locks for every backed-up path and the service. Sets `restore_status = in_progress`.
-2. `restore_files` (same as the automatic rollback, step 3).
-3. Config test, then reload with `allow_restart = false` (the automatic rollback uses the strategy's value).
+1. Resolves the scope (below), takes the locks for every backed-up path and the service of every affected installation.
+   Sets `restore_status = in_progress`.
+2. `restore_files` once for the whole manifest (same as the automatic rollback, step 3).
+3. Config test of every affected service type, then reload of every affected service with `allow_restart = false`
+   (the automatic rollback uses the strategy's value). As in the engine, a reload only happens if one had started
+   (`reload_started` on a target of the unit) or the deployment `completed`; a backup restored on its own always reloads.
 4. `verify_files_match`.
-5. Probes each endpoint of the installation up to 5 times, 1 second apart, and expects the previous certificate.
-6. Records the outcome in `restore_status` (`restored` or `failed`), the target status (`rolled_back` or
-   `manual_intervention_required`), and the audit log (`BACKUP_RESTORED` or `BACKUP_RESTORE_FAILED`).
+5. Probes each endpoint of every affected installation up to 5 times, 1 second apart. A positive match with the previous
+   certificate is required for each.
+6. Records the outcome in `restore_status` (`restored` or `failed`), the status of **every** affected target (`rolled_back`
+   or `manual_intervention_required`), the inventory of every affected installation, and the audit log
+   (`BACKUP_RESTORED` or `BACKUP_RESTORE_FAILED`, with the target ids and services).
+
+**Shared backups (fixed).** `UnitRunner` attaches one backup to every target of a unit that shares files (for example nginx
+and Apache using the same certificate and key). The restore therefore resolves, via `resolve_restore_scope`: all targets
+with the same `backup_id` and their installations; for a backup not tied to a deployment, all installations on that server
+whose cert/key/chain/fullchain path (or realpath) appears in the manifest. All of them are one unit: one lock set, one
+file restore, config test and reload per service, and verification of every endpoint. If any step fails, **all** affected
+targets become `manual_intervention_required` and the error names the failing service (for example
+`restore of the shared unit failed (apache, nginx; failing service: apache): ...`). Codes are unchanged. The 202 response
+of both endpoints lists `unit_target_ids` and `services`, and says that the whole unit is restored when the backup is shared.
 
 **Asynchronous (fixed).** The request only validates, checks the locks, sets `restore_status = in_progress` (and the target's
 `current_step = manual_rollback`), writes the audit event (`DEPLOYMENT_MANUAL_ROLLBACK` or `BACKUP_RESTORE_REQUESTED`) and queues
 the task. No second restore is refused while one is `in_progress`: a lost message would block restores for good, and the file
 locks serialise two restores of the same files.
 
-**Served check, a difference from automatic rollback (Known issue).** The manual routine accepts an endpoint that is not
-reachable. It only fails when the endpoint answers with a different fingerprint (`if got is not None and got != prev_fp`).
-The automatic routine, `_verify_baseline`, fails on an unreachable endpoint too. So a manual restore can report `ok: true`
-with `served_fingerprint: null` while the endpoint is down. Checked by reading the code.
+**Served check (fixed).** The manual routine requires a positive match with the previous fingerprint, like the automatic
+`_verify_baseline`: an unreachable endpoint fails the restore (`RESTORE_SERVED_MISMATCH`).
 
 ---
 
@@ -341,4 +354,6 @@ restore that hits an endpoint which is down, or a symlink changed after the back
 | K6 | A lost lock did not stop the work. | **Fixed.** `LOCK_LOST` before the next mutating step; rollback if already activated. |
 | K7 | Cancellation is not honoured after activation starts. | **Kept** (it would leave mixed files). The cancel response says `too_late`. |
 | - | Manual restore and manual target rollback ran inside the HTTP request. | **Fixed.** 202 and Celery task `backups.restore`; the worker re-authorises. |
-| - | Manual served check accepts an unreachable endpoint (section 7). | Open, unchanged. |
+| - | Manual served check accepted an unreachable endpoint (section 7). | **Fixed.** A positive fingerprint match is required. |
+| - | Manual restore of a backup shared by several targets/services handled only the primary one. | **Fixed.** One unit: all services and endpoints are locked, restored, reloaded, verified and recorded together (section 7). |
+| - | The initiating user was revoked during an interrupted deployment and mid-mutation targets were just cancelled. | **Fixed.** The system restores the previous state (deployment-engine section 13.1). |

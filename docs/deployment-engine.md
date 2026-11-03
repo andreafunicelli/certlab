@@ -574,6 +574,27 @@ Consequence: a crash after the target status becomes `activating` but before the
 and `test_k2_crash_after_all_files_installed_continues_without_reinstalling` cover the `mixed` and `all_new` cases (names
 read; not run). Unit tests cover resume in `test_engine.py`.
 
+### 13.1 Initiating user revoked during an interrupted deployment
+
+Authorization to *continue* a deployment is separate from the duty to leave the host in a known state. When a redelivered job
+finds the initiating user disabled, deleted or without `deployments:create` (`JobRunner._authz_revoked`):
+
+- Targets that never started mutating (`pending`, `backing_up`, `staging`, `validating`, with no persisted `activated` /
+  `reload_started`) become `cancelled` with `AUTHZ`. If no unit needs recovery the job ends `failed` as before.
+- Units that may have mutated (a mutating status, or `activated` / `reload_started` in the persisted state) are run by
+  `UnitRunner(revoked=...)`: connect, take the locks, `reconcile`, then `_resume_revoked`. It never continues forward (no
+  activation, no verification of the new certificate; `_activate_and_verify` refuses). If the files provably equal the backup
+  and nothing was replaced, the unit is `cancelled` (`AUTHZ`). In every other case (`mixed`, `all_new`, or a rollback that
+  was already in progress) the routine of section 12/rollback.md runs: restore from the verified backup, config test,
+  reload only if a reload had started, files equal to the backup and the previous fingerprint served again. Result:
+  `rolled_back` with error code `AUTHZ_REVOKED` (new code, informational), or `manual_intervention_required` (the usual
+  `ROLLBACK_*` code, message prefixed with `AUTHZ_REVOKED`). `no_backup` / `backup_corrupt` stay `RECONCILE_FAILED`.
+- Audit: actor `deployment-engine`; `DEPLOYMENT_AUTHZ_REVOKED` (job) and `DEPLOYMENT_AUTHZ_REVOKED_RECOVERY` (unit, with the
+  revoked user, the classification and the outcome). `rollback.triggered` / `rollback.failed` are notified as for any rollback.
+- The job status is derived as usual from the target statuses.
+
+Tests: `tests/unit/deploy/test_revoked_and_shared_restore.py`.
+
 ---
 
 ## 14. Cancellation checkpoints
@@ -594,7 +615,8 @@ rollback. `cancel_requested` stays set on the job, and the cancel response says 
 Stopping between two file installs would leave a mixed set of files, which is exactly the state rollback exists to avoid.
 
 Each checkpoint also re-checks the initiating user. A disabled user, or one who lost `deployments:create`, produces an
-`AUTHZ` error. Before activation that is a plain `failed`. After activation it triggers a rollback.
+`AUTHZ` error. Before activation that is a plain `failed`. After activation it triggers a rollback. A user revoked while
+the worker was dead is handled at resume by the safety recovery of section 13.1.
 
 ---
 
@@ -730,6 +752,8 @@ Other facts:
 | K12 | `allow_restart` can drop connections, and no live test covers it. | Section 5.2 | Design, untested. **Kept.** |
 | K13 | The certbot message pointed to a document that did not exist. | Section 15 | **Fixed.** Section 15 explains certbot deploy hooks and leaving certbot-managed paths alone; the message points there. |
 | K14 | Units on one server are serialised. A high `concurrency` does not speed up a single server. | Section 5.1 | Design, by code. **Kept.** |
+| K15 | A user revoked during an interrupted deployment left mid-mutation targets `cancelled` and unreconciled. | `JobRunner._authz_revoked`, `UnitRunner._resume_revoked` | **Fixed.** Section 13.1: restore of the previous state under the system actor, never forward. |
+| K16 | A manual restore of a backup shared between services reloaded, verified and recorded only the primary service. | `restore_backup_async`, `resolve_restore_scope` | **Fixed.** The whole unit is restored and verified together; any failure puts all its targets in `manual_intervention_required` (rollback.md section 7). |
 
 Manual restores (`POST /api/v1/backups/{id}/restore`) and manual target rollbacks
 (`POST /api/v1/deployments/{id}/targets/{target}/rollback`) no longer run inside the HTTP request: they answer 202 and run in the

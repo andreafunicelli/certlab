@@ -612,6 +612,9 @@ export interface RestoreQueued {
   job_id: string | null;
   restore_status: string;
   message: string;
+  /** Every target restored together (a backup shared by several installations is one unit). */
+  unit_target_ids?: string[];
+  services?: string[];
 }
 
 export function useRestoreBackup() {

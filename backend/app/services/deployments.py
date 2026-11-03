@@ -401,7 +401,9 @@ def queue_restore(db: Session, actor: User, backup: Backup, target: DeploymentTa
     """Queue a manual restore / manual target rollback for a worker. Permission and re-authentication were checked at
     the API; the worker authorises again. Progress is shown by ``backup.restore_status`` (``in_progress`` ->
     ``restored`` / ``failed``) and, for a target rollback, the target's status and ``current_step``."""
-    keys = engine.restore_lock_keys(db, backup)
+    scope = engine.resolve_restore_scope(db, backup, target)
+    unit = engine.manual_restore_targets(scope, target)
+    keys = engine.restore_lock_keys(db, backup, target, scope)
     held = locks.active_locks(keys)
     if held:
         raise AppError("LOCK_HELD", "Another deployment or restore holds a lock on this target; try again when it has finished",
@@ -410,13 +412,15 @@ def queue_restore(db: Session, actor: User, backup: Backup, target: DeploymentTa
     # serialise two restores of the same files (the routine is idempotent: files that match the backup are skipped)
     prior = backup.restore_status if backup.restore_status != "in_progress" else "none"
     backup.restore_status = "in_progress"
-    if target is not None:
-        target.current_step = "manual_rollback"
+    for t in unit:
+        t.current_step = "manual_rollback"
     audit.record(db, action="DEPLOYMENT_MANUAL_ROLLBACK" if target is not None else "BACKUP_RESTORE_REQUESTED",
                  resource_type="deployment_target" if target is not None else "backup",
                  resource_id=target.id if target is not None else backup.id, actor=actor,
-                 after={"backup_id": str(backup.id), "queued": True})
+                 after={"backup_id": str(backup.id), "queued": True,
+                        "unit_target_ids": [str(t.id) for t in unit], "services": scope.service_types()})
     db.commit()
+    unit_ids = [t.id for t in unit]
     try:
         dispatch_restore(backup.id, actor.id, target.id if target is not None else None, prior, permission)
     except Exception as exc:
@@ -424,17 +428,25 @@ def queue_restore(db: Session, actor: User, backup: Backup, target: DeploymentTa
         db.rollback()
         backup = db.get(Backup, backup.id)
         backup.restore_status = prior
-        if target is not None:
-            db.get(DeploymentTarget, target.id).current_step = None
+        for tid in unit_ids:
+            ut = db.get(DeploymentTarget, tid)
+            if ut is not None and ut.current_step == "manual_rollback":
+                ut.current_step = None
         audit.record(db, action="BACKUP_RESTORE_FAILED", resource_type="backup", resource_id=backup.id, actor=actor,
                      after={"error_code": "QUEUE_UNAVAILABLE"}, outcome="failure", error="job queue unavailable")
         db.commit()
         raise AppError("QUEUE_UNAVAILABLE", "The job queue is unavailable; the restore was not started. Try again shortly.",
                        503) from exc
     db.expire_all()
+    others = [str(i) for i in unit_ids if target is None or i != target.id]
+    message = "The restore was queued. Follow backup.restore_status and the target status."
+    if others:
+        message = (f"The restore was queued. This backup is shared by {len(others)} other target(s) of the same unit "
+                   f"({', '.join(others)}): the whole unit is restored and verified together, and all of its targets "
+                   "change status. Follow backup.restore_status and the target statuses.")
     return {"accepted": True, "backup_id": str(backup.id), "target_id": str(target.id) if target is not None else None,
             "job_id": str(target.job_id) if target is not None else None, "restore_status": "in_progress",
-            "message": "The restore was queued. Follow backup.restore_status and the target status."}
+            "unit_target_ids": [str(i) for i in unit_ids], "services": scope.service_types(), "message": message}
 
 
 def rollback_target(db: Session, actor: User, job_id: uuid.UUID, target_id: uuid.UUID) -> dict[str, Any]:

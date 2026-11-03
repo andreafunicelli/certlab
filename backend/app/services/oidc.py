@@ -140,7 +140,7 @@ def complete_login(db: Session, code: str, state: str, cookie_value: str | None)
         if users_repo.by_username(db, username):
             username = f"{username[:50]}-{secrets.token_hex(3)}"
         user = User(username=username, email=email, display_name=str(claims.get("name") or username)[:128],
-                    auth_provider="oidc", oidc_subject=subject)
+                    auth_provider="oidc", oidc_subject=subject, enabled=True)
         db.add(user)
         audit.record(db, action="USER_PROVISIONED_OIDC", resource_type="user", actor=user,
                      after={"username": username})

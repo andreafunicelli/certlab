@@ -329,6 +329,11 @@ def _check_rule(event_type: str | None, filters: dict[str, Any] | None) -> None:
         extra = set(filters) - {"environment"}
         if extra:
             raise AppError("INVALID_FILTER", f"unsupported filter(s): {', '.join(sorted(extra))}", 422)
+        environment = filters.get("environment")
+        if environment is not None and not isinstance(environment, str) and not (
+            isinstance(environment, list) and all(isinstance(name, str) for name in environment)
+        ):
+            raise AppError("INVALID_FILTER", "environment must be a string or a list of strings", 422)
 
 
 def list_rules(db: Session) -> list[dict[str, Any]]:

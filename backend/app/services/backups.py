@@ -15,6 +15,7 @@ import json
 import posixpath
 import tarfile
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
@@ -170,12 +171,14 @@ class RestoreOutcome:
     error: str | None = None
 
 
-async def restore_files(db: Session, host: RemoteHost, backup: Backup, *, only_changed: bool = True) -> RestoreOutcome:
+async def restore_files(db: Session, host: RemoteHost, backup: Backup, *, only_changed: bool = True,
+                        before_change: Callable[[], None] | None = None) -> RestoreOutcome:
     """Write every backed-up file back (content, mode, owner, group) and verify by re-stat.
 
     Idempotent: files whose current sha256/mode/owner already equal the backup are left alone. The caller is
     responsible for config test / reload / service verification afterwards. Never raises for per-file remote failures;
-    they are reported in the outcome (the caller then escalates to manual intervention).
+    they are reported in the outcome (the caller then escalates to manual intervention). ``before_change`` checks
+    lock ownership before remote mutations; a failed check aborts the restore.
     """
     try:
         verify_backup(backup, db)
@@ -185,6 +188,8 @@ async def restore_files(db: Session, host: RemoteHost, backup: Backup, *, only_c
     stage = None
     try:
         for f in backup.manifest["files"]:
+            if before_change:
+                before_change()
             path = f["path"]
             try:
                 cur = await host.stat(path)
@@ -194,10 +199,16 @@ async def restore_files(db: Session, host: RemoteHost, backup: Backup, *, only_c
                     out.files.append(FileRestoreResult(path, "unchanged"))
                     continue
                 content = load_file_content(f, db)
+                if before_change:
+                    before_change()
                 if stage is None:
                     stage = await host.stage_dir()
                 name = f"restore-{f['index']:02d}.bin"
+                if before_change:
+                    before_change()
                 await host.write_staged(stage, name, content, 0o600)
+                if before_change:
+                    before_change()
                 await host.install(posixpath.join(stage, name), path, int(f["mode"]), f["owner"], f["group"])
                 after = await host.stat(path)
                 if after.sha256 != f["sha256"] or after.mode != f["mode"]:
@@ -218,6 +229,8 @@ async def restore_files(db: Session, host: RemoteHost, backup: Backup, *, only_c
                 await host.cleanup(stage)
             except Exception:  # noqa: BLE001 - leftover staging is cleaned by the helper's own housekeeping
                 log.warning("restore_cleanup_failed")
+    if before_change:
+        before_change()
     return out
 
 

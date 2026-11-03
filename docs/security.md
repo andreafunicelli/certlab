@@ -84,8 +84,8 @@ Enabled only when issuer, client ID and client secret are all set (see [configur
   account already uses that email, login fails with 409 `OIDC_EMAIL_CONFLICT`. Accounts are not linked
   automatically.
 
-**Gap:** the OIDC flow has not been tested against a live identity provider. No automated test in `backend/tests`
-references OIDC.
+**Gap:** the OIDC flow has not been tested against a live identity provider. Automated provisioning/disabled-user
+regressions in `backend/tests/unit/test_oidc.py` use signed ID tokens and a simulated provider.
 
 ### 1.7 Re-authentication for sensitive actions
 

@@ -902,6 +902,148 @@
         }
       }
     },
+    "/api/v1/servers/import/template": {
+      "get": {
+        "tags": [
+          "servers"
+        ],
+        "summary": "Import Template",
+        "operationId": "import_template_api_v1_servers_import_template_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/servers/import": {
+      "post": {
+        "tags": [
+          "servers"
+        ],
+        "summary": "Import Servers",
+        "operationId": "import_servers_api_v1_servers_import_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_import_servers_api_v1_servers_import_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportResultOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/servers/host-keys/scan": {
+      "post": {
+        "tags": [
+          "servers"
+        ],
+        "summary": "Bulk Scan Host Keys",
+        "operationId": "bulk_scan_host_keys_api_v1_servers_host_keys_scan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HostKeyBulkScan"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostKeyBulkScanOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/servers/host-keys/enroll": {
+      "post": {
+        "tags": [
+          "servers"
+        ],
+        "summary": "Bulk Enroll Host Keys",
+        "operationId": "bulk_enroll_host_keys_api_v1_servers_host_keys_enroll_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HostKeyBulkEnroll"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostKeyBulkEnrollOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/servers/{server_id}": {
       "get": {
         "tags": [
@@ -3616,7 +3758,7 @@
           }
         ],
         "responses": {
-          "200": {
+          "202": {
             "description": "Successful Response",
             "content": {
               "application/json": {
@@ -3801,6 +3943,7 @@
           "backups"
         ],
         "summary": "Restore Backup",
+        "description": "Queue the restore for a worker (202). Follow ``backup.restore_status`` (``in_progress`` -> ``restored``/``failed``)\nand, when the backup belongs to a completed/failed target, that target's status.",
         "operationId": "restore_backup_api_v1_backups__backup_id__restore_post",
         "parameters": [
           {
@@ -3815,7 +3958,7 @@
           }
         ],
         "responses": {
-          "200": {
+          "202": {
             "description": "Successful Response",
             "content": {
               "application/json": {
@@ -4374,6 +4517,34 @@
         ],
         "title": "AuditEventOut"
       },
+      "Body_import_servers_api_v1_servers_import_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          },
+          "dry_run": {
+            "type": "boolean",
+            "title": "Dry Run",
+            "default": true
+          },
+          "on_conflict": {
+            "type": "string",
+            "enum": [
+              "error",
+              "skip"
+            ],
+            "title": "On Conflict",
+            "default": "error"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_import_servers_api_v1_servers_import_post"
+      },
       "Body_upload_version_api_v1_certificate_versions_post": {
         "properties": {
           "certificate": {
@@ -4737,6 +4908,11 @@
             "type": "boolean",
             "title": "Requires Approval",
             "default": false
+          },
+          "require_trusted_chain": {
+            "type": "boolean",
+            "title": "Require Trusted Chain",
+            "default": false
           }
         },
         "type": "object",
@@ -4774,6 +4950,11 @@
           "requires_approval": {
             "type": "boolean",
             "title": "Requires Approval"
+          },
+          "require_trusted_chain": {
+            "type": "boolean",
+            "title": "Require Trusted Chain",
+            "default": false
           },
           "server_count": {
             "type": "integer",
@@ -4840,6 +5021,17 @@
               }
             ],
             "title": "Requires Approval"
+          },
+          "require_trusted_chain": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Require Trusted Chain"
           }
         },
         "type": "object",
@@ -4892,6 +5084,266 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
+      "HostKeyBulkEnroll": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/HostKeyBulkEnrollItem"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "minItems": 1,
+            "title": "Items"
+          },
+          "replace": {
+            "type": "boolean",
+            "title": "Replace",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "HostKeyBulkEnroll"
+      },
+      "HostKeyBulkEnrollItem": {
+        "properties": {
+          "server_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Server Id"
+          },
+          "public_key": {
+            "type": "string",
+            "maxLength": 8192,
+            "minLength": 20,
+            "title": "Public Key"
+          },
+          "fingerprint_sha256": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 10,
+            "title": "Fingerprint Sha256"
+          }
+        },
+        "type": "object",
+        "required": [
+          "server_id",
+          "public_key",
+          "fingerprint_sha256"
+        ],
+        "title": "HostKeyBulkEnrollItem"
+      },
+      "HostKeyBulkEnrollOut": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/HostKeyBulkEnrollResult"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "HostKeyBulkEnrollOut"
+      },
+      "HostKeyBulkEnrollResult": {
+        "properties": {
+          "server_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Server Id"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "enrolled",
+              "error"
+            ],
+            "title": "Status"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "type": "object",
+        "required": [
+          "server_id",
+          "status"
+        ],
+        "title": "HostKeyBulkEnrollResult"
+      },
+      "HostKeyBulkScan": {
+        "properties": {
+          "server_ids": {
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "type": "array",
+            "maxItems": 200,
+            "minItems": 1,
+            "title": "Server Ids"
+          }
+        },
+        "type": "object",
+        "required": [
+          "server_ids"
+        ],
+        "title": "HostKeyBulkScan"
+      },
+      "HostKeyBulkScanItem": {
+        "properties": {
+          "server_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Server Id"
+          },
+          "server_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Server Name"
+          },
+          "endpoint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Endpoint"
+          },
+          "key_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Key Type"
+          },
+          "fingerprint_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fingerprint Sha256"
+          },
+          "public_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Public Key"
+          },
+          "enrolled_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enrolled Fingerprint"
+          },
+          "matches_enrolled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Matches Enrolled"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "type": "object",
+        "required": [
+          "server_id"
+        ],
+        "title": "HostKeyBulkScanItem"
+      },
+      "HostKeyBulkScanOut": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/HostKeyBulkScanItem"
+            },
+            "type": "array",
+            "title": "Items"
+          }
+        },
+        "type": "object",
+        "required": [
+          "items"
+        ],
+        "title": "HostKeyBulkScanOut"
+      },
       "HostKeyEnroll": {
         "properties": {
           "public_key": {
@@ -4941,6 +5393,183 @@
           "public_key"
         ],
         "title": "HostKeyScanOut"
+      },
+      "ImportFieldError": {
+        "properties": {
+          "field": {
+            "type": "string",
+            "title": "Field"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "field",
+          "message"
+        ],
+        "title": "ImportFieldError"
+      },
+      "ImportHostKey": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "not_provided",
+              "enrolled",
+              "mismatch",
+              "unreachable",
+              "pending"
+            ],
+            "title": "Status",
+            "default": "not_provided"
+          },
+          "fingerprint_expected": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fingerprint Expected"
+          },
+          "fingerprint_seen": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fingerprint Seen"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "type": "object",
+        "title": "ImportHostKey"
+      },
+      "ImportResultOut": {
+        "properties": {
+          "dry_run": {
+            "type": "boolean",
+            "title": "Dry Run"
+          },
+          "delimiter": {
+            "type": "string",
+            "title": "Delimiter"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "valid": {
+            "type": "integer",
+            "title": "Valid"
+          },
+          "invalid": {
+            "type": "integer",
+            "title": "Invalid"
+          },
+          "skipped": {
+            "type": "integer",
+            "title": "Skipped"
+          },
+          "created": {
+            "type": "integer",
+            "title": "Created"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/ImportRowOut"
+            },
+            "type": "array",
+            "title": "Rows"
+          }
+        },
+        "type": "object",
+        "required": [
+          "dry_run",
+          "delimiter",
+          "total",
+          "valid",
+          "invalid",
+          "skipped",
+          "created",
+          "rows"
+        ],
+        "title": "ImportResultOut"
+      },
+      "ImportRowOut": {
+        "properties": {
+          "row": {
+            "type": "integer",
+            "title": "Row"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "valid",
+              "error",
+              "skipped",
+              "created"
+            ],
+            "title": "Status"
+          },
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/ImportFieldError"
+            },
+            "type": "array",
+            "title": "Errors"
+          },
+          "server_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Server Id"
+          },
+          "host_key": {
+            "$ref": "#/components/schemas/ImportHostKey"
+          }
+        },
+        "type": "object",
+        "required": [
+          "row",
+          "status"
+        ],
+        "title": "ImportRowOut"
       },
       "InstallationPatch": {
         "properties": {
@@ -5805,6 +6434,11 @@
             "type": "integer",
             "title": "Certificate Count",
             "default": 0
+          },
+          "host_key_reset": {
+            "type": "boolean",
+            "title": "Host Key Reset",
+            "default": false
           },
           "created_at": {
             "type": "string",

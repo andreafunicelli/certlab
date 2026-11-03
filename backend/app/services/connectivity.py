@@ -112,18 +112,48 @@ def scan_host_key(db: Session, actor: User, server_id: uuid.UUID) -> dict[str, s
             "public_key": info.public_key_openssh}
 
 
-def enroll_host_key(db: Session, actor: User, server_id: uuid.UUID, public_key: str, fingerprint: str,
-                    replace: bool) -> Server:
-    """Admin-confirmed enrollment: the posted fingerprint AND key must equal a fresh scan."""
+def scan_many(targets: list[tuple[Any, str, int]], timeout: float, concurrency: int = 5) -> dict[Any, tuple[Any, dict | None]]:
+    """Scan host keys of many ``(key, host, port)`` targets with bounded concurrency and a per-host timeout.
+
+    Returns ``{key: (HostKeyInfo | None, None | {"code", "message"})}``. Never raises for per-host failures.
+    """
     ssh = _import_ssh()
+
+    async def one(sem: asyncio.Semaphore, host: str, port: int):
+        async with sem:
+            try:
+                return await asyncio.wait_for(ssh.scan_host_key(host, port, timeout), timeout + 2), None
+            except Exception as exc:  # noqa: BLE001 - per-host failure is reported, not raised
+                code = getattr(exc, "code", None)
+                from app.integrations.ssh.sanitize import sanitize_output
+
+                msg = getattr(exc, "message", None) or type(exc).__name__
+                return None, {"code": getattr(code, "value", None) or ("TIMEOUT" if isinstance(exc, TimeoutError) else "UNKNOWN"),
+                              "message": sanitize_output(str(msg), 200)}
+
+    async def main():
+        sem = asyncio.Semaphore(concurrency)
+        results = await asyncio.gather(*(one(sem, h, p) for _, h, p in targets))
+        return {k: r for (k, _, _), r in zip(targets, results, strict=True)}
+
+    return _run(main()) if targets else {}
+
+
+def enroll_host_key(db: Session, actor: User, server_id: uuid.UUID, public_key: str, fingerprint: str,
+                    replace: bool, *, fresh: Any = None, note: str | None = None) -> Server:
+    """Admin-confirmed enrollment: the posted fingerprint AND key must equal a fresh scan.
+
+    ``fresh`` lets bulk callers supply an already-performed fresh scan (same verification applies)."""
     server = _get_server(db, server_id)
-    settings = settings_service.get_section_data(db, "ssh")
-    try:
-        fresh = _run(ssh.scan_host_key(server.address or server.hostname, server.ssh_port,
-                                       float(settings["connect_timeout"])))
-    except Exception as exc:
-        raise AppError("HOST_KEY_SCAN_FAILED", "Could not retrieve the host key from the server", 502,
-                       {"reason": getattr(exc, "message", type(exc).__name__)}) from exc
+    if fresh is None:
+        ssh = _import_ssh()
+        settings = settings_service.get_section_data(db, "ssh")
+        try:
+            fresh = _run(ssh.scan_host_key(server.address or server.hostname, server.ssh_port,
+                                           float(settings["connect_timeout"])))
+        except Exception as exc:
+            raise AppError("HOST_KEY_SCAN_FAILED", "Could not retrieve the host key from the server", 502,
+                           {"reason": getattr(exc, "message", type(exc).__name__)}) from exc
     posted_key = " ".join(public_key.split()[:2])
     fresh_key = " ".join(fresh.public_key_openssh.split()[:2])
     if _norm_fp(fingerprint) != _norm_fp(fresh.fingerprint_sha256) or posted_key != fresh_key:
@@ -149,7 +179,8 @@ def enroll_host_key(db: Session, actor: User, server_id: uuid.UUID, public_key: 
     audit.record(db, action="HOST_KEY_REPLACED" if previous and previous != fresh.fingerprint_sha256 else "HOST_KEY_ENROLLED",
                  resource_type="server", resource_id=server.id, actor=actor,
                  before={"fingerprint": previous}, after={"fingerprint": fresh.fingerprint_sha256,
-                                                          "key_type": fresh.key_type})
+                                                          "key_type": fresh.key_type,
+                                                          **({"detail": note} if note else {})})
     db.commit()
     return server
 

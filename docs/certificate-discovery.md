@@ -51,24 +51,50 @@ read), [deployment-engine.md](deployment-engine.md) (what happens to classified 
 6. **Persistence** (`persist_collection`, one transaction). Certificates are upserted by SHA-256 fingerprint, installations
    by identity key (section 6), findings are written to `discovery_findings`, and installations no longer seen are marked
    missing (section 7). Notifications are sent for drift and failures.
-7. **Result.** `completed`, `partial` (at least one service or the filesystem scan failed; the rest is saved), or
-   `failed`. Progress is published on Redis pub/sub and streamed from `GET /api/v1/discovery-jobs/{id}/events`. The
+7. **Result.** `completed` (steps that hit a problem are `warning` and `warnings_count` is set; at least one failed service
+   or a failed filesystem scan is listed in `stats.failed_services` and the rest is saved), or `failed`. Progress is published on Redis pub/sub and streamed from `GET /api/v1/discovery-jobs/{id}/events`. The
    stream is advisory. The database is the source of truth.
 
-### 2.1 Job error codes (`discovery_jobs.error`, format `CODE: message`)
+### 2.1 Job error codes (`discovery_jobs.error_code`; `error` holds the human message)
 
 | Code | When |
 |---|---|
-| `AUTHORIZATION_REVOKED` | The requesting user is missing or lost `discovery:run` before execution. |
-| `SERVER_NOT_FOUND`, `SERVER_DISABLED` | Server deleted or disabled after the job was queued. |
-| `SERVER_HAS_NO_CREDENTIAL`, `SSH_UNAVAILABLE` | Raised by `connectivity.load_credential` and the SSH import (`_import_ssh`). |
-| `HOST_KEY_MISMATCH`, `HOST_KEY_UNKNOWN`, `AUTH_REJECTED`, `TIMEOUT`, `CONNECTION_REFUSED`, `DNS_FAILURE`, `UNKNOWN` | A `RemoteErrorCode` raised while connecting. See [troubleshooting.md](troubleshooting.md). |
-| `TIMEOUT` | The 20-minute job timeout expired (`discovery timed out`). |
-| `UNEXPECTED_ERROR` | Any other exception in collection. The traceback is logged, not stored. |
-| `PERSIST_FAILED` | The collected results could not be saved. The transaction is rolled back. |
+| `DISCOVERY_AUTHORIZATION_REVOKED` | The requesting user is missing or lost `discovery:run` before execution. |
+| `DISCOVERY_SERVER_NOT_FOUND`, `DISCOVERY_SERVER_DISABLED` | Server deleted or disabled after the job was queued. |
+| `DISCOVERY_SERVER_HAS_NO_CREDENTIAL`, `DISCOVERY_SSH_UNAVAILABLE` | Raised by `connectivity.load_credential` and the SSH import (`_import_ssh`). |
+| `HOST_KEY_MISMATCH`, `HOST_KEY_UNKNOWN`, `AUTH_REJECTED`, `TIMEOUT`, `CONNECTION_REFUSED`, `DNS_FAILURE`, `HELPER_MISSING`, `PERMISSION_DENIED`, `PATH_NOT_ALLOWED`, `UNSUPPORTED_OS`, `UNKNOWN` | A `RemoteErrorCode` raised while connecting or probing. See [troubleshooting.md](troubleshooting.md). |
+| `DISCOVERY_TIMEOUT` | The 20-minute job timeout expired (`discovery timed out`). |
+| `DISCOVERY_ABANDONED` | No progress for 30 minutes; the job was expired. |
+| `DISCOVERY_QUEUE_UNAVAILABLE` | The job could not be queued. |
+| `DISCOVERY_UNEXPECTED_ERROR` | Any other exception in collection. The traceback is logged, not stored. |
+| `DISCOVERY_PERSIST_FAILED` | The collected results could not be saved. The transaction is rolled back. |
+
+A failed job carries a short actionable `hint` per code (for example `HOST_KEY_UNKNOWN`: "Enroll the host key on the
+server page"; `HELPER_MISSING` / `PERMISSION_DENIED`: install.sh and the sudoers rule, see
+[ssh-permissions.md](ssh-permissions.md); `PATH_NOT_ALLOWED`: `ALLOWED_ROOTS` in `/etc/cdp-helper.conf`). The hint is also
+stored in the failing step's `detail.hint`.
 
 A `HOST_KEY_MISMATCH` also writes an audit event `HOST_KEY_CHANGED` and a critical `hostkey.changed` notification.
 `TIMEOUT`, `CONNECTION_REFUSED`, `DNS_FAILURE` and `AUTH_REJECTED` also produce `server.unreachable`.
+
+### 2.2 Step timeline and log
+
+Every job persists (progressively, on each step change, so a reload shows progress) two JSON documents:
+
+- `steps[]`: `{name, label, status, started_at, finished_at, duration_ms, detail, error_code}` with `status` one of
+  `pending`, `running`, `ok`, `warning`, `failed`, `skipped`. Order: `connect` (SSH + host key), `probe` (OS and
+  services), `service:nginx`, `service:apache`, `service:haproxy` (config dump and parse: `refs_found`, `unresolved`; not
+  installed services are `skipped` with a reason), `resolve` (`ok`, `missing`, `unreadable`, `errors`, `unsupported`),
+  `filesystem_scan` (`roots`, `files_examined`, `candidates`, `truncated` when `discovery_max_files` was hit), `parse`
+  (`certificates_parsed`, `parse_errors`), `inventory` (certificates and installations created/updated/unchanged,
+  `marked_missing`, `drift_detected`), `finalize`. After a failure the remaining steps are `skipped`.
+- `log[]`: `{ts, level, step, message, details}`, every message passed through the SSH output sanitizer (no PEM blocks,
+  no long base64). At most 500 entries: the first 450, a truncation marker, and the last 49.
+
+Partial problems (a service configuration that could not be read, unreadable or missing referenced files, a truncated
+scan) do not fail the job: it is `completed`, the affected steps are `warning`, and the job reports `warnings_count`.
+Each finished job also emits one structured `discovery_finished` log event (server, status, duration, error code,
+counts; no secrets).
 
 ---
 
@@ -80,7 +106,7 @@ The helper returns the configuration as text. The parser is pure (no I/O). Helpe
 ### 3.1 nginx
 
 Source: `nginx -T` (helper `dump nginx`). If `nginx -T` exits non-zero, the helper exits 9 and nginx is recorded as a
-failed service (`partial` job). The dump is not filtered by `ALLOWED_ROOTS`. `nginx -T` prints every file nginx loaded.
+failed service (`warning` step, job `completed`). The dump is not filtered by `ALLOWED_ROOTS`. `nginx -T` prints every file nginx loaded.
 Only parsed references are stored.
 
 | Handled | Not handled |
@@ -221,7 +247,7 @@ when their target is inside `ALLOWED_ROOTS`. Only these names are matched: `*.pe
 - **Truncation is silent.** The helper prints `truncated: true` when the budget is hit. `find_cert_files` discards that flag.
   No finding or note is stored.
 - **A root outside the allowed roots fails the scan.** A missing root (exit 12) is skipped. A root that is not allowed
-  (exit 3) raises an error. That error stops the filesystem scan, so the job is `partial`
+  (exit 3) raises an error. That error stops the filesystem scan, so the `filesystem_scan` step is `warning`
   (`failed_services.filesystem`). Other roots already scanned are not kept in that case. **Known issue** (from reading).
 
 ### 5.4 What is kept
@@ -232,6 +258,9 @@ For each candidate path (already-referenced paths are skipped):
   rather than the `archive` file.
 - The file is read with `read-public`, then parsed. Only the leaf certificate is kept.
 - **CA certificates** (`is_ca` true) are dropped with no finding and no note.
+- **CA trust bundles** (2 or more certificates, all CA, no private key, e.g. the system store `/etc/ssl/cert.pem` or
+  `/etc/pki/tls/certs/ca-bundle.crt`) are skipped with an `info` log line, not a finding or a warning. Without this, every
+  scan of a Debian/Ubuntu/RHEL host would end "completed with warnings".
 - Combined PEM files produce a note (`unreadable`, "contains private key material; content not read").
 - PKCS#12 and JKS files produce a note (`unsupported`). Other kinds (private keys, CSRs, unrelated PEM) are skipped with
   no note.

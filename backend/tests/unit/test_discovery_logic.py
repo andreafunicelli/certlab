@@ -296,7 +296,7 @@ def test_execute_job_reauthorizes_user_and_rechecks_server(db, monkeypatch):
     assert discovery.execute_job(job.id) == "failed"
     db.expire_all()
     j = db.get(DiscoveryJob, job.id)
-    assert "AUTHORIZATION_REVOKED" in j.error
+    assert j.error_code == "DISCOVERY_AUTHORIZATION_REVOKED"
     # server disabled after queueing
     admin = make_user(db, "adm1", "admin")
     j2 = discovery.create_job(db, server, admin)
@@ -304,7 +304,7 @@ def test_execute_job_reauthorizes_user_and_rechecks_server(db, monkeypatch):
     db.commit()
     assert discovery.execute_job(j2.id) == "failed"
     db.expire_all()
-    assert "SERVER_DISABLED" in db.get(DiscoveryJob, j2.id).error
+    assert db.get(DiscoveryJob, j2.id).error_code == "DISCOVERY_SERVER_DISABLED"
     with pytest.raises(Exception) as ei:
         discovery.create_job(db, server, admin)
     assert getattr(ei.value, "code", "") == "SERVER_DISABLED"
@@ -344,3 +344,215 @@ def test_schedule_due_uses_system_actor_and_interval(admin, db):
     assert job.server_id == due.id and job.requested_by is None            # system actor
     assert discovery.schedule_due(db) == []                                   # already pending; others not due
     assert nokey.last_discovery_at is None
+
+
+# ------------------------------------------------------------------------------ step timeline + log
+def _steps(job):
+    return {s["name"]: s for s in job.steps}
+
+
+def test_job_steps_and_log_content_with_warnings(db, pki, monkeypatch):
+    server = _server(db)
+    server.host_key_fingerprint, server.host_key_type = "SHA256:" + "A" * 43, "ssh-ed25519"
+    db.commit()
+    secret = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"
+    host = FakeHost(
+        files={"/etc/ssl/a/fullchain.pem": pki.fullchain_pem, "/etc/ssl/a/privkey.pem": b"k"},
+        read_errors={"/etc/ssl/d.pem": RemoteError(RemoteErrorCode.PERMISSION_DENIED, "denied " + secret)},
+        services=("nginx", "haproxy"))
+    refs = [ref(), ref("/etc/ssl/d.pem", "/etc/ssl/a/privkey.pem", ("d.example.com",)),
+            ref("/etc/ssl/gone.pem", "/etc/ssl/a/privkey.pem", ("g.example.com",))]
+    host.files["/etc/ssl/d.pem"] = b""
+    host.found = [("/etc/ssl/a/fullchain.pem", FileKind.CERT_BUNDLE)]
+
+    class Haproxy(HaproxyAdapter):
+        async def discover(self, h):
+            raise RemoteError(RemoteErrorCode.COMMAND_FAILED, "dump failed " + secret)
+
+    def adapter_for(svc):
+        return adapter_with(refs)(svc) if svc == ServiceType.NGINX else Haproxy()
+
+    monkeypatch.setattr("app.integrations.services.adapters.get_adapter", adapter_for)
+    admin = make_user(db, "root2", "admin")
+    job = discovery.create_job(db, server, admin)
+    assert discovery.execute_job(job.id, connect_factory=_patch_connect(monkeypatch, host)) == "completed"
+    db.expire_all()
+    job = db.get(DiscoveryJob, job.id)
+    st = _steps(job)
+    assert [s["name"] for s in job.steps] == ["connect", "probe", "service:nginx", "service:apache", "service:haproxy",
+                                               "resolve", "filesystem_scan", "parse", "inventory", "finalize"]
+    assert st["connect"]["status"] == "ok" and st["connect"]["detail"]["username"] == "u"
+    assert st["probe"]["status"] == "ok" and st["probe"]["detail"]["os_family"] == "debian"
+    assert st["service:nginx"]["status"] == "ok" and st["service:nginx"]["detail"]["refs_found"] == 3
+    assert st["service:apache"]["status"] == "skipped" and "not installed" in st["service:apache"]["detail"]["reason"]
+    assert st["service:haproxy"]["status"] == "warning" and st["service:haproxy"]["error_code"] == "COMMAND_FAILED"
+    assert st["service:haproxy"]["detail"]["hint"]
+    assert (st["resolve"]["status"], st["resolve"]["detail"]["unreadable"], st["resolve"]["detail"]["missing"]) == ("warning", 1, 1)
+    assert st["filesystem_scan"]["detail"]["truncated"] is False and "/etc/ssl" in st["filesystem_scan"]["detail"]["roots"]
+    assert st["parse"]["detail"]["certificates_parsed"] == 1
+    assert st["inventory"]["status"] == "ok" and st["inventory"]["detail"]["installations_created"] == 3
+    assert st["finalize"]["status"] == "ok"
+    for s in job.steps:
+        if s["status"] not in ("pending", "skipped"):
+            assert s["started_at"] and s["finished_at"] and isinstance(s["duration_ms"], int)
+    # job summary
+    assert job.status == "completed" and job.error is None and job.error_code is None
+    out = discovery.job_out(job, "srv1", detail=True)
+    assert out["warnings_count"] == 2 and out["hint"] is None and out["duration_ms"] is not None
+    # log: events present, nothing secret
+    text = "\n".join(e["message"] for e in job.log)
+    assert "connected as u" in text and "host key verified" in text and "OS detected" in text
+    assert "nginx 1: 3 certificate reference(s)" in text
+    assert "/etc/ssl/gone.pem" in text and "unreadable" in text and "certificate created" in text
+    assert "CN=a.example.com" in text
+    assert {e["level"] for e in job.log} >= {"info", "warning", "error"}
+    assert all(set(e) == {"ts", "level", "step", "message", "details"} for e in job.log)
+    assert "PRIVATE KEY" not in str(job.log) + str(job.steps) and "MIIEvQ" not in str(job.log) + str(job.steps)
+
+
+def test_failed_job_has_error_code_hint_and_skipped_rest(db, monkeypatch):
+    server = _server(db)
+    admin = make_user(db, "root3", "admin")
+
+    @contextlib.asynccontextmanager
+    async def refuse(_t, _c):
+        raise RemoteError(RemoteErrorCode.HOST_KEY_MISMATCH, "mismatch")
+        yield
+
+    from app.services import connectivity
+    monkeypatch.setattr(connectivity, "build_target", lambda *_a, **_k: SimpleNamespace())
+    monkeypatch.setattr(connectivity, "load_credential", lambda *_a, **_k: SimpleNamespace())
+    job = discovery.create_job(db, server, admin)
+    assert discovery.execute_job(job.id, connect_factory=refuse) == "failed"
+    db.expire_all()
+    job = db.get(DiscoveryJob, job.id)
+    assert job.error_code == "HOST_KEY_MISMATCH" and job.error == "mismatch"
+    st = _steps(job)
+    assert st["connect"]["status"] == "failed" and st["connect"]["error_code"] == "HOST_KEY_MISMATCH"
+    assert "re-enroll" in st["connect"]["detail"]["hint"]
+    assert all(s["status"] == "skipped" for n, s in st.items() if n != "connect")
+    out = discovery.job_out(job, "srv1", detail=True)
+    assert out["hint"] == st["connect"]["detail"]["hint"] and out["status"] == "failed"
+    assert job.log[-1]["level"] == "error"
+    assert db.get(Server, server.id).connection_status == "host_key_mismatch"
+
+
+@pytest.mark.parametrize("code,needle", [
+    ("HOST_KEY_UNKNOWN", "Enroll the host key"), ("AUTH_REJECTED", "authorized_keys"),
+    ("HELPER_MISSING", "install.sh"), ("PERMISSION_DENIED", "sudoers"), ("PATH_NOT_ALLOWED", "ALLOWED_ROOTS"),
+    ("CONNECTION_REFUSED", "SSH port"), ("TIMEOUT", "firewall"), ("DNS_FAILURE", "resolves"),
+    ("UNSUPPORTED_OS", "not supported"), ("SOMETHING_ELSE", "job log")])
+def test_hints(code, needle):
+    from app.services.discovery_log import hint_for
+    assert needle in hint_for(code)
+
+
+def test_log_cap_truncation_marker_and_sanitizing():
+    from app.services.discovery_log import JobRecorder
+
+    published = []
+    rec = JobRecorder(publish=published.append)
+    for i in range(1200):
+        rec.info("resolve", f"entry {i} " + "A" * 200 + ("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----" if i == 3 else ""))
+    entries = rec.entries
+    assert len(entries) == 500
+    assert entries[0]["message"].startswith("entry 0") and entries[449]["message"].startswith("entry 449")
+    assert "truncated" in entries[450]["message"] and entries[450]["details"]["omitted"] == 1200 - 450 - 49
+    assert entries[-1]["message"].startswith("entry 1199")
+    assert "BEGIN CERTIFICATE" not in str(entries) and "[REDACTED-PEM]" in entries[3]["message"]
+    assert len(published) == 1200 and published[0]["type"] == "log"
+    rec.start("probe")
+    rec.finish("probe", "ok", blob="Q" * 500, items=list(range(100)))
+    step = rec.steps[0]
+    assert "REDACTED" in step["detail"]["blob"] and len(step["detail"]["items"]) == 51
+    assert published[-1]["type"] == "step"
+
+
+def test_progress_is_persisted_while_running(db, pki, monkeypatch):
+    server = _server(db)
+    host = FakeHost(files={"/etc/ssl/a/fullchain.pem": pki.fullchain_pem, "/etc/ssl/a/privkey.pem": b"k"})
+    seen = []
+    orig = host.find_cert_files
+
+    async def spying(*a, **k):
+        from app.core.db import SessionLocal
+        with SessionLocal() as other:
+            j = other.scalars(select(DiscoveryJob)).one()
+            seen.append((j.status, {s["name"]: s["status"] for s in (j.steps or [])}, len(j.log or [])))
+        return await orig(*a, **k)
+
+    host.find_cert_files = spying
+    monkeypatch.setattr("app.integrations.services.adapters.get_adapter", adapter_with([ref()]))
+    admin = make_user(db, "root4", "admin")
+    job = discovery.create_job(db, server, admin)
+    discovery.execute_job(job.id, connect_factory=_patch_connect(monkeypatch, host))
+    status, steps, n_log = seen[0]
+    assert status == "running" and steps["connect"] == "ok" and steps["probe"] == "ok" and steps["resolve"] == "ok"
+    assert steps["filesystem_scan"] == "running" and n_log > 3
+
+
+def test_scan_limit_marks_filesystem_step_warning(db, pki, monkeypatch):
+    server = _server(db)
+    host = FakeHost(files={"/etc/ssl/a/fullchain.pem": pki.fullchain_pem, "/etc/ssl/a/privkey.pem": b"k"})
+    monkeypatch.setattr("app.integrations.services.adapters.get_adapter", adapter_with([ref()]))
+    admin = make_user(db, "root5", "admin")
+    job = discovery.create_job(db, server, admin)
+    from app.services import settings as settings_service
+
+    monkeypatch.setattr(settings_service, "get_section_data", lambda _db, _s: {**SSH, "discovery_max_files": 10,
+                        "connect_timeout": 5, "command_timeout": 5, "default_port": 22})
+    host.found = [(f"/etc/ssl/x{i}.pem", FileKind.PRIVATE_KEY) for i in range(10)]
+    discovery.execute_job(job.id, connect_factory=_patch_connect(monkeypatch, host))
+    db.expire_all()
+    j = db.get(DiscoveryJob, job.id)
+    fs = _steps(j)["filesystem_scan"]
+    assert fs["status"] == "warning" and fs["detail"]["truncated"] is True
+    assert any("scan limit" in e["message"] for e in j.log)
+
+
+def test_job_api_detail_and_list_summaries(admin, db, pki, monkeypatch):
+    server = _server(db)
+    host = FakeHost(files={"/etc/ssl/a/fullchain.pem": pki.fullchain_pem, "/etc/ssl/a/privkey.pem": b"k"})
+    monkeypatch.setattr("app.integrations.services.adapters.get_adapter", adapter_with([ref()]))
+    from app.models import User
+    user = db.query(User).first()
+    job = discovery.create_job(db, server, user)
+    discovery.execute_job(job.id, connect_factory=_patch_connect(monkeypatch, host))
+    old = DiscoveryJob(server_id=server.id, status="completed", started_at=utcnow(), finished_at=utcnow())  # pre-0005 row
+    db.add(old)
+    db.commit()
+    d = admin.get(f"/api/v1/discovery-jobs/{job.id}").json()
+    for k in ("id", "server_id", "server_name", "status", "requested_by_name", "created_at", "started_at",
+              "finished_at", "duration_ms", "error", "error_code", "hint", "warnings_count", "stats", "steps", "log",
+              "findings"):
+        assert k in d, k
+    assert d["server_name"] == "srv1" and d["requested_by_name"] == user.username and d["steps"] and d["log"]
+    legacy = admin.get(f"/api/v1/discovery-jobs/{old.id}").json()
+    assert legacy["steps"] == [] and legacy["log"] == [] and legacy["warnings_count"] == 0 and legacy["error_code"] is None
+    lst = admin.get(f"/api/v1/servers/{server.id}/discovery-jobs?page=1&page_size=10").json()
+    assert lst["total"] == 2 and lst["page"] == 1 and lst["page_size"] == 10
+    for it in lst["items"]:
+        assert "steps" not in it and "log" not in it and "findings" not in it
+        for k in ("id", "status", "requested_by_name", "created_at", "started_at", "finished_at", "duration_ms",
+                  "error", "error_code", "hint", "warnings_count", "stats"):
+            assert k in it, k
+    assert admin.get("/api/v1/discovery-jobs").json()["items"][0]["warnings_count"] == 0
+
+
+def test_migration_0005_adds_columns(db):
+    from sqlalchemy import inspect
+    cols = {c["name"]: c for c in inspect(db.get_bind()).get_columns("discovery_jobs")}
+    assert {"steps", "log", "error_code"} <= set(cols) and all(cols[c]["nullable"] for c in ("steps", "log", "error_code"))
+
+
+def test_ca_trust_bundle_is_ignored_not_a_warning():
+    """System trust stores (e.g. /etc/ssl/cert.pem with 100+ CAs) must not make every scan 'completed with warnings'."""
+    from app.services.discovery import _ca_bundle_size
+    from tests.fixtures.pki import make_pki
+
+    pki = make_pki()
+    bundle = pki.root.cert_pem + pki.intermediate.cert_pem
+    assert _ca_bundle_size(bundle) == 2
+    assert _ca_bundle_size(pki.root.cert_pem) == 0                         # a single CA cert is not a bundle
+    assert _ca_bundle_size(pki.leaf.cert_pem + pki.intermediate.cert_pem) == 0   # a fullchain is a real installation
+    assert _ca_bundle_size(bundle + pki.leaf.key_pem) == 0                 # anything with a key is never skipped

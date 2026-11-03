@@ -206,18 +206,47 @@ state-changing request on this list (POST, PUT, PATCH, DELETE) also needs the CS
 | GET | `/servers` | `servers:read` | Paged. Filters `q`, `environment`, `status`. |
 | POST | `/servers` | `servers:write` | |
 | GET | `/servers/{server_id}` | `servers:read` | |
-| PATCH | `/servers/{server_id}` | `servers:write` | |
+| PATCH | `/servers/{server_id}` | `servers:write` | If `hostname`, `address` or `ssh_port` actually changes, the enrolled host key is cleared (`connection_status` becomes `host_key_unknown`, audit `HOST_KEY_CLEARED`) and the response carries `host_key_reset: true` (always `false` elsewhere). The new endpoint is never trusted automatically; re-enroll the key. Changing the bastion does not reset the key. |
 | POST | `/servers/{server_id}/disable` | `servers:write` | |
 | POST | `/servers/{server_id}/enable` | `servers:write` | |
 | DELETE | `/servers/{server_id}` | `servers:write` | |
 | POST | `/servers/{server_id}/host-key/scan` | `servers:hostkey` | Fetches the host key. Does not enrol it. |
 | POST | `/servers/{server_id}/host-key/enroll` | `servers:hostkey` | The posted key and fingerprint must match a fresh scan (409 `HOST_KEY_CHANGED_DURING_ENROLL` otherwise). Replacing an enrolled key needs `replace=true` (409 `HOST_KEY_ALREADY_ENROLLED` otherwise). |
+| GET | `/servers/import/template` | `servers:write` | CSV template (`cert-deploy-pro-servers-template.csv`). |
+| POST | `/servers/import` | `servers:write` | Multipart `file`, form `dry_run` (default `true`) and `on_conflict` (`error` or `skip`). See section 9.4.1. |
+| POST | `/servers/host-keys/scan` | `servers:hostkey` | `{server_ids}` (1-200). Scans with concurrency 5. Per item: `endpoint`, `key_type`, `fingerprint_sha256`, `public_key`, `enrolled_fingerprint`, `matches_enrolled` (`null` when nothing is enrolled or the scan failed), `error_code`, `error`. |
+| POST | `/servers/host-keys/enroll` | `servers:hostkey` | `{items: [{server_id, public_key, fingerprint_sha256}], replace}` (1-200). Every item is re-verified against a fresh scan exactly like the single enroll (no re-authentication required, same as single enroll); per-item `status` is `enrolled` or `error` with `error_code`. |
 | POST | `/servers/{server_id}/test-connection` | `servers:test` | Runs the connection steps: DNS, TCP, host key, authentication, helper, OS and services. |
 | POST | `/servers/{server_id}/discover` | `discovery:run` | 202, returns the job. |
 | GET | `/environments` | `environments:read` | Not paged. |
 | POST | `/environments` | `environments:write` | |
 | PATCH | `/environments/{env_id}` | `environments:write` | `is_production` and `requires_approval` drive approval rules. |
 | DELETE | `/environments/{env_id}` | `environments:write` | |
+
+#### 9.4.1 CSV server import
+
+Columns (header required, any order, case-insensitive): `name`, `hostname`, `address`, `ssh_port`, `ssh_username`,
+`environment`, `credential`, `privilege_mode`, `bastion`, `tags`, `description`, `host_key_fingerprint`. Required:
+`name`, `hostname`, `ssh_username`, `environment`. Unknown columns are rejected (422 `IMPORT_INVALID_FILE`).
+
+- UTF-8 (BOM allowed); delimiter `,` or `;` is auto-detected; at most 1 MiB (413 `IMPORT_FILE_TOO_LARGE`) and 1000 data rows
+  (422 `IMPORT_TOO_MANY_ROWS`). Blank lines and lines starting with `#` are ignored. One record per line.
+  The reported `row` is the 1-based line number in the file.
+- `ssh_port` defaults to the SSH default port setting; `privilege_mode` to `helper-sudo`; `credential` is an existing
+  credential name (default: the configured default credential, else none); `bastion` is an existing server name or a
+  server defined elsewhere in the file (forward references allowed; self references, cycles and chained bastions are
+  rejected); `tags` are separated by `;` or `|` (use `|` when the file delimiter is `;`).
+- Rows are validated like `POST /servers` (hostname/IP, port range, name pattern, environment exists) plus duplicates
+  inside the file and against existing servers (`on_conflict=skip` turns the latter into `skipped` rows).
+- `dry_run=true` validates only: no database writes and no network access.
+- `dry_run=false`: if any row is `error` the response is 422 `IMPORT_HAS_ERRORS` with the full report in
+  `error.details`. Otherwise all servers are created in one transaction (all or nothing; audit `SERVER_CREATED` per
+  server and `SERVERS_IMPORTED`).
+- `host_key_fingerprint` (`SHA256:...`): after creation the server's key is scanned (concurrency 5, SSH connect
+  timeout) and enrolled only if it matches exactly (audit `HOST_KEY_ENROLLED`, "pinned via CSV import").
+  `host_key.status` is `enrolled`, `mismatch` (not enrolled, audit failure), `unreachable`, or `pending` (no
+  fingerprint: the server stays unenrolled; keys are never trusted automatically). In a dry run it is `pending` (with
+  fingerprint) or `not_provided`.
 
 ### 9.5 Certificates and installations
 
@@ -237,10 +266,10 @@ state-changing request on this list (POST, PUT, PATCH, DELETE) also needs the CS
 | Method | Path | Permission | Notes |
 |---|---|---|---|
 | POST | `/discovery-jobs/bulk` | `discovery:run` | 202. `server_ids`, up to 200. Per-server refusals in `errors`. |
-| GET | `/discovery-jobs` | `discovery:read` | Paged. Filters `server_id`, `status`. |
-| GET | `/discovery-jobs/{job_id}` | `discovery:read` | Includes `findings`. |
+| GET | `/discovery-jobs` | `discovery:read` | Paged. Filters `server_id`, `status`. Items are summaries (no `steps`, `log` or `findings`): `id`, `server_id`, `server_name`, `status`, `requested_by_name`, `created_at`, `started_at`, `finished_at`, `duration_ms`, `error`, `error_code`, `hint`, `warnings_count`, `stats`. |
+| GET | `/discovery-jobs/{job_id}` | `discovery:read` | The summary fields plus `steps[]`, `log[]` and `findings[]` (`[]` for jobs created before migration 0005). See [certificate-discovery.md](certificate-discovery.md) section 2.2. |
 | GET | `/discovery-jobs/{job_id}/events` | `discovery:read` | Server-sent events (section 10). |
-| GET | `/servers/{server_id}/discovery-jobs` | `discovery:read` | Paged. |
+| GET | `/servers/{server_id}/discovery-jobs` | `discovery:read` | Paged (`page`, `page_size`). Summary items, as `GET /discovery-jobs`. |
 
 ### 9.7 Certificate versions (uploads)
 
@@ -313,6 +342,7 @@ Reads need `notifications:read`. Writes need `notifications:write`.
 
 - `event: snapshot` is sent first, built from the database. A client that reconnects gets a fresh snapshot.
 - `event: progress` carries each job event published on Redis pub/sub (for example a target's step change).
+- Discovery jobs also publish `progress` messages with `type` `step` (`{step: {...}}`, the full step object) and `type` `log` (`{entry: {...}}`), and the snapshot includes `steps`.
 - `event: end` is sent when the job reaches a terminal state, and then the stream closes.
 
 Each `data:` line is JSON with `kind`, `job_id`, `type`, `ts` and the event's own fields. Events are advisory. If Redis is

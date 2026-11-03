@@ -105,9 +105,10 @@ export function useLiveDeployment(id: string) {
 }
 
 // ---------------------------------------------------------------------------------------------
-function StepIcon({ state }: { state: string }) {
+export function StepIcon({ state }: { state: string }) {
   if (state === "ok") return <CheckCircle2 className="size-3.5 text-ok" />;
   if (state === "failed") return <XCircle className="size-3.5 text-danger" />;
+  if (state === "warning") return <AlertTriangle className="size-3.5 text-warn" />;
   if (state === "running") return <Loader2 className="size-3.5 animate-spin text-info" />;
   if (state === "skipped") return <MinusCircle className="size-3.5 text-muted-foreground" />;
   return <CircleDashed className="size-3.5 text-muted-foreground" />;
@@ -132,7 +133,7 @@ const STEP_LABELS: Record<string, string> = {
 export const stepLabel = (n: string) =>
   STEP_LABELS[n] ?? n.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
 
-function detailText(d: TargetStep["detail"]): string | null {
+export function detailText(d: TargetStep["detail"]): string | null {
   if (!d) return null;
   if (typeof d === "string") return d;
   const parts = Object.entries(d)
@@ -144,7 +145,7 @@ function detailText(d: TargetStep["detail"]): string | null {
   return parts.length ? parts.join(" · ") : null;
 }
 
-const clock = (iso: string | null) => (iso ? fmtDateTime(iso).slice(11) : "");
+export const clock = (iso: string | null) => (iso ? fmtDateTime(iso).slice(11) : "");
 
 function TargetPanel({
   job,

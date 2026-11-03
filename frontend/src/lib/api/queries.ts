@@ -33,17 +33,24 @@ import type {
   DeploymentJob,
   DeploymentPlan,
   DiscoveryJob,
+  DiscoveryJobSummary,
   Environment,
   EnvironmentCreate,
   EnvironmentUpdate,
   ExpiryTrend,
+  HostKeyEnrollItem,
+  HostKeyEnrollResult,
   HostKeyScan,
+  HostKeyScanItem,
+  ImportOnConflict,
+  ImportResult,
   Installation,
   Me,
   Page,
   Server,
   ServerCreate,
   ServerUpdate,
+  ServerUpdateResult,
   SettingsSection,
   SettingsSectionName,
   UploadedVersion,
@@ -92,7 +99,8 @@ export const qk = {
   discoveryJobs: {
     all: ["discovery-jobs"] as const,
     detail: (id: string) => ["discovery-jobs", "detail", id] as const,
-    forServer: (id: string) => ["discovery-jobs", "server", id] as const,
+    forServer: (id: string, p?: Query) => ["discovery-jobs", "server", id, p ?? {}] as const,
+    forServerAll: (id: string) => ["discovery-jobs", "server", id] as const,
   },
   notifications: {
     channels: ["notifications", "channels"] as const,
@@ -165,7 +173,7 @@ export const api = {
     list: (q?: Query) => get<Page<Server>>("/servers", q),
     get: (id: string) => get<Server>(`/servers/${id}`),
     create: (b: ServerCreate) => post<Server>("/servers", b),
-    update: (id: string, b: ServerUpdate) => patch<Server>(`/servers/${id}`, b),
+    update: (id: string, b: ServerUpdate) => patch<ServerUpdateResult>(`/servers/${id}`, b),
     remove: (id: string) => del(`/servers/${id}`),
     enable: (id: string) => post<Server>(`/servers/${id}/enable`),
     disable: (id: string) => post<Server>(`/servers/${id}/disable`),
@@ -181,7 +189,33 @@ export const api = {
     deployments: (id: string, q?: Query) =>
       get<Page<DeploymentJob>>(`/servers/${id}/deployments`, q),
     discoveryJobs: (id: string, q?: Query) =>
-      get<Page<DiscoveryJob>>(`/servers/${id}/discovery-jobs`, q),
+      get<Page<DiscoveryJobSummary>>(`/servers/${id}/discovery-jobs`, q),
+    /** CSV import. The file is sent as multipart and never kept client-side beyond the request. */
+    importCsv: (file: File, dryRun: boolean, onConflict: ImportOnConflict) => {
+      const f = new FormData();
+      f.set("file", file);
+      f.set("dry_run", dryRun ? "true" : "false");
+      f.set("on_conflict", onConflict);
+      return postForm<ImportResult>("/servers/import", f);
+    },
+    /** Fetches the CSV template (credentialed) and returns it as a Blob for saving. */
+    importTemplate: async (): Promise<Blob> => {
+      const res = await fetch(`${API_BASE}/servers/import/template`, {
+        credentials: "include",
+        headers: { Accept: "text/csv" },
+      });
+      if (!res.ok)
+        throw new ApiError({
+          status: res.status,
+          code: `HTTP_${res.status}`,
+          message: "Could not download the template",
+        });
+      return res.blob();
+    },
+    scanHostKeys: (server_ids: string[]) =>
+      post<{ items: HostKeyScanItem[] }>("/servers/host-keys/scan", { server_ids }),
+    enrollHostKeys: (items: HostKeyEnrollItem[], replace = false) =>
+      post<{ items: HostKeyEnrollResult[] }>("/servers/host-keys/enroll", { items, replace }),
   },
   environments: {
     list: () => get<Environment[]>("/environments"),
@@ -377,7 +411,7 @@ export function useDiscoverServer() {
     mutationFn: api.servers.discover,
     onSettled: (_d, _e, id) => {
       invalidateServers(qc);
-      void qc.invalidateQueries({ queryKey: qk.discoveryJobs.forServer(id) });
+      void qc.invalidateQueries({ queryKey: qk.discoveryJobs.forServerAll(id) });
     },
   });
 }
@@ -625,8 +659,38 @@ export function useRestoreBackup() {
   });
 }
 
-export const useServerDiscoveryJobs = (id: string) =>
+export const useServerDiscoveryJobs = (id: string, params: Query = { page_size: 5 }) =>
   useQuery({
-    queryKey: qk.discoveryJobs.forServer(id),
-    queryFn: () => api.servers.discoveryJobs(id, { page_size: 5 }),
+    queryKey: qk.discoveryJobs.forServer(id, params),
+    queryFn: () => api.servers.discoveryJobs(id, params),
+    placeholderData: keepPreviousData,
   });
+
+export function useImportServers() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      file,
+      dryRun,
+      onConflict,
+    }: {
+      file: File;
+      dryRun: boolean;
+      onConflict: ImportOnConflict;
+    }) => api.servers.importCsv(file, dryRun, onConflict),
+    onSuccess: (r) => {
+      if (!r.dry_run) invalidateServers(qc);
+    },
+  });
+}
+export function useScanHostKeys() {
+  return useMutation({ mutationFn: api.servers.scanHostKeys });
+}
+export function useEnrollHostKeys() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ items, replace }: { items: HostKeyEnrollItem[]; replace?: boolean }) =>
+      api.servers.enrollHostKeys(items, replace),
+    onSuccess: () => invalidateServers(qc),
+  });
+}

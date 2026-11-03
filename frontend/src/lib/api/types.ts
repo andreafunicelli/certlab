@@ -487,20 +487,50 @@ export interface DiscoveryStats {
   installations_created?: number;
   installations_updated?: number;
 }
-/** Discovery job as returned by POST /servers/{id}/discover, GET /discovery-jobs/{id}. */
-export interface DiscoveryJob {
-  id: string;
-  status: string; // pending | running | completed | partial | failed | cancelled
-  server_id: string;
-  server_name?: string | null;
-  requested_by: string | null;
-  scheduled?: boolean;
+export type DiscoveryJobStatus =
+  "pending" | "running" | "completed" | "partial" | "failed" | "cancelled";
+export type DiscoveryStepStatus = "pending" | "running" | "ok" | "warning" | "failed" | "skipped";
+export interface DiscoveryStep {
+  name: string;
+  label: string;
+  status: DiscoveryStepStatus | string;
   started_at: string | null;
   finished_at: string | null;
-  stats: DiscoveryStats | null;
-  error: string | null;
+  duration_ms: number | null;
+  detail: Record<string, unknown> | null;
+  error_code: string | null;
+}
+export interface DiscoveryLogEntry {
+  ts: string;
+  level: "info" | "warning" | "error" | string;
+  step: string | null;
+  message: string;
+  details?: Record<string, unknown> | null;
+}
+/** Row of GET /servers/{id}/discovery-jobs. */
+export interface DiscoveryJobSummary {
+  id: string;
+  status: DiscoveryJobStatus | string;
+  requested_by_name: string | null;
   created_at: string;
-  findings?: DiscoveryFindingRow[];
+  started_at: string | null;
+  finished_at: string | null;
+  duration_ms: number | null;
+  error: string | null;
+  error_code: string | null;
+  hint: string | null;
+  warnings_count: number;
+  stats: DiscoveryStats | null;
+}
+/** Discovery job as returned by POST /servers/{id}/discover, GET /discovery-jobs/{id}. */
+export interface DiscoveryJob extends DiscoveryJobSummary {
+  server_id: string;
+  server_name?: string | null;
+  requested_by?: string | null;
+  scheduled?: boolean;
+  steps?: DiscoveryStep[] | undefined;
+  log?: DiscoveryLogEntry[] | undefined;
+  findings?: DiscoveryFindingRow[] | undefined;
 }
 export interface DiscoveryProgress {
   type: string;
@@ -513,3 +543,59 @@ export interface DiscoveryProgress {
 
 /** Loose shape kept for endpoints that are not modelled. */
 export type Row = Record<string, unknown> & { id: string };
+
+// ---- server update / host keys / CSV import
+export type ServerUpdateResult = Server & { host_key_reset?: boolean };
+
+export interface HostKeyScanItem {
+  server_id: string;
+  server_name: string;
+  endpoint: string | null;
+  key_type: string | null;
+  fingerprint_sha256: string | null;
+  public_key: string | null;
+  enrolled_fingerprint: string | null;
+  matches_enrolled: boolean | null;
+  error_code: string | null;
+  error: string | null;
+}
+export interface HostKeyEnrollItem {
+  server_id: string;
+  public_key: string;
+  fingerprint_sha256: string;
+}
+export interface HostKeyEnrollResult {
+  server_id: string;
+  status: "enrolled" | "error";
+  error_code: string | null;
+  error: string | null;
+}
+
+export type ImportOnConflict = "error" | "skip";
+export type ImportRowStatus = "valid" | "error" | "skipped" | "created";
+export type ImportHostKeyStatus =
+  "not_provided" | "enrolled" | "mismatch" | "unreachable" | "pending";
+export interface ImportRow {
+  row: number;
+  name: string | null;
+  hostname?: string | null;
+  status: ImportRowStatus;
+  errors: { field: string | null; message: string }[];
+  server_id: string | null;
+  host_key: {
+    status: ImportHostKeyStatus;
+    fingerprint_expected: string | null;
+    fingerprint_seen: string | null;
+    error: string | null;
+  } | null;
+}
+export interface ImportResult {
+  dry_run: boolean;
+  delimiter: string;
+  total: number;
+  valid: number;
+  invalid: number;
+  skipped: number;
+  created: number;
+  rows: ImportRow[];
+}

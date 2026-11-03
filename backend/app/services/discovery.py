@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -28,7 +29,7 @@ from app.core.errors import AppError, conflict, not_found
 from app.core.logging import get_logger
 from app.core.permissions import authorize
 from app.integrations.certificates import parse_upload
-from app.integrations.certificates.parse import classify_pem
+from app.integrations.certificates.parse import classify_pem, parse_pem_certificates
 from app.integrations.contracts import (
     CertInfo,
     ConfigCertRef,
@@ -39,6 +40,7 @@ from app.integrations.contracts import (
     RemoteFileStat,
     ServiceType,
 )
+from app.integrations.ssh.sanitize import sanitize_output
 from app.models import (
     CertificateInstallation,
     DiscoveryFinding,
@@ -49,6 +51,7 @@ from app.models import (
 from app.models.base import utcnow
 from app.services import audit, events, inventory, notifications
 from app.services import settings as settings_service
+from app.services.discovery_log import JobRecorder, hint_for
 from app.services.inventory import DiscoveredInstallation
 from app.services.verify_sni import resolve_verify_sni
 
@@ -61,12 +64,25 @@ JOB_TIMEOUT_SECONDS = 20 * 60
 ProgressFn = Callable[[str, int, str], None]
 
 
+
+def _ca_bundle_size(data: bytes) -> int:
+    """Number of certificates if ``data`` is a CA trust bundle (2+ certificates, all CA and no private key), else 0."""
+    if b"PRIVATE KEY" in data:
+        return 0
+    try:
+        certs = parse_pem_certificates(data)
+    except Exception:  # noqa: BLE001 - unparseable content is reported by the normal parse path
+        return 0
+    return len(certs) if len(certs) >= 2 and all(c.is_ca for c in certs) else 0
+
+
 def is_certbot_path(path: str | None, realpath: str | None = None) -> bool:
     return bool((path and path.startswith(CERTBOT_LIVE)) or (realpath and realpath.startswith(CERTBOT_ARCHIVE)))
 
 
 # =============================================================================================== collection
 @dataclass
+
 class Note:
     """A finding that is not an installation (unsupported file, failed service, ...)."""
     path: str | None
@@ -103,6 +119,19 @@ class _Resolver:
         self.stats: dict[str, RemoteFileStat | RemoteError] = {}
         self.referenced_realpaths: set[str] = set()
         self.referenced_paths: set[str] = set()
+        self.parsed = 0
+        self.parse_errors = 0
+        self.parse_seconds = 0.0
+
+    def parse(self, data: bytes):
+        t0 = time.monotonic()
+        bundle = parse_upload(cert_pem=data)
+        self.parse_seconds += time.monotonic() - t0
+        if bundle.leaf is None:
+            self.parse_errors += 1
+        else:
+            self.parsed += 1
+        return bundle
 
     async def stat(self, path: str) -> RemoteFileStat:
         cached = self.stats.get(path)
@@ -218,7 +247,7 @@ class _Resolver:
                 return d
         else:
             kind = classify_pem(data)
-            bundle = parse_upload(cert_pem=data)
+            bundle = self.parse(data)
             if bundle.leaf is None:
                 if kind in (FileKind.PKCS12, FileKind.JKS):
                     d.classification, d.message = "unsupported", f"unsupported certificate container ({kind.value})"
@@ -285,15 +314,19 @@ class _Resolver:
         return d
 
 
-async def _scan(host: Any, res: _Resolver, ssh: dict[str, Any], col: Collection, progress: ProgressFn) -> None:
+async def _scan(host: Any, res: _Resolver, ssh: dict[str, Any], col: Collection, progress: ProgressFn,
+                rec: JobRecorder | None = None) -> dict[str, Any]:
+    rec = rec or JobRecorder()
     # the SSH layer only understands absolute path prefixes; glob-style excludes are applied here
     prefixes = [e for e in ssh["discovery_exclude"] if e.startswith("/") and not any(c in e for c in "*?[")]
     globs = [e for e in ssh["discovery_exclude"] if e not in prefixes]
-    found = [
-        (p, k) for p, k in await host.find_cert_files(ssh["discovery_roots"], ssh["discovery_max_depth"],
-                                                      ssh["discovery_max_files"], prefixes)
-        if not any(fnmatch.fnmatch(p, g) for g in globs)
-    ]
+    max_files = ssh["discovery_max_files"]
+    raw = await host.find_cert_files(ssh["discovery_roots"], ssh["discovery_max_depth"], max_files, prefixes)
+    truncated = len(raw) >= max_files
+    found = [(p, k) for p, k in raw if not any(fnmatch.fnmatch(p, g) for g in globs)]
+    if truncated:
+        rec.warning("filesystem_scan", f"scan limit reached: {max_files} files (discovery_max_files); "
+                    "some certificate files may not have been examined", {"max_files": max_files})
     candidates: list[str] = []
     for path, kind in found:
         if path in res.referenced_paths:
@@ -302,22 +335,33 @@ async def _scan(host: Any, res: _Resolver, ssh: dict[str, Any], col: Collection,
             candidates.append(path)
         elif kind in (FileKind.PKCS12, FileKind.JKS):
             col.notes.append(Note(path, "unsupported", f"{kind.value} container is not supported", {"kind": kind.value}))
+            rec.info("filesystem_scan", f"{path}: unsupported container ({kind.value})")
         elif kind == FileKind.COMBINED_PEM:
             col.notes.append(Note(path, "unreadable", "combined PEM contains private key material; content not read",
                                   {"kind": kind.value}))
+            rec.warning("filesystem_scan", f"{path}: combined PEM with private key material, content not read")
     progress("scan", 85, f"{len(candidates)} certificate file(s) found by filesystem scan")
+    rec.info("filesystem_scan", f"{len(found)} file(s) examined, {len(candidates)} certificate candidate(s)",
+             {"roots": list(ssh["discovery_roots"])})
+    unreadable = 0
     groups: dict[str, list[tuple[str, RemoteFileStat]]] = {}
     for path in sorted(candidates):
         try:
             st = await res.stat(path)
         except RemoteError as exc:
             col.notes.append(Note(path, "unreadable", f"cannot stat: {_err_text(exc)}"))
+            rec.warning("filesystem_scan", f"{path}: cannot stat ({exc.code.value}: {_err_text(exc)})")
+            unreadable += 1
             continue
         if not st.exists or not st.readable:
             col.notes.append(Note(path, "unreadable" if st.exists else "error",
                                   "file not readable" if st.exists else "broken symlink or missing file"))
+            rec.warning("filesystem_scan", f"{path}: " + ("not readable by the service account" if st.exists
+                                                          else "broken symlink or missing file"))
+            unreadable += 1
             continue
         groups.setdefault(st.realpath or path, []).append((path, st))
+    added = 0
     for real, members in groups.items():
         if real in res.referenced_realpaths:
             continue
@@ -329,11 +373,19 @@ async def _scan(host: Any, res: _Resolver, ssh: dict[str, Any], col: Collection,
         except RemoteError as exc:
             helper = exc.details.get("helper_error")
             col.notes.append(Note(path, "unreadable", f"cannot read: {helper or _err_text(exc)}"))
+            rec.warning("filesystem_scan", f"{path}: cannot read ({helper or exc.code.value})")
+            unreadable += 1
             continue
-        bundle = parse_upload(cert_pem=data)
+        ca_count = _ca_bundle_size(data)
+        if ca_count:
+            # System trust stores (/etc/ssl/cert.pem, ca-bundle.crt, ...) exist on every host: not a problem to report.
+            rec.info("filesystem_scan", f"{path}: CA trust bundle with {ca_count} CA certificates, ignored")
+            continue
+        bundle = res.parse(data)
         if bundle.leaf is None:
             msg = "; ".join(f.message for f in bundle.findings)[:200] or "no certificate"
             col.notes.append(Note(path, "unsupported", f"not parsed: {msg}"))
+            rec.warning("parse", f"{path}: not parsed ({msg})")
             continue
         if bundle.leaf.is_ca:
             continue                         # CA certificates lying around are not server certificates
@@ -345,69 +397,163 @@ async def _scan(host: Any, res: _Resolver, ssh: dict[str, Any], col: Collection,
             source="filesystem",
         )
         col.items.append(d)
+        added += 1
+        rec.info("filesystem_scan", f"{path}: certificate {bundle.leaf.fingerprint_sha256[:16]} "
+                 f"CN={bundle.leaf.common_name}", {"path": path})
+    return {"roots": list(ssh["discovery_roots"]), "files_examined": len(found), "candidates": len(candidates),
+            "certificates_found": added, "unreadable": unreadable, "truncated": truncated, "max_files": max_files}
+
+
+def _classify_problem(d: DiscoveredInstallation) -> str | None:
+    """'missing' | 'unreadable' | 'error' for resolve-step accounting, None when the reference resolved fine."""
+    if d.classification == "unreadable":
+        return "unreadable"
+    if d.classification == "error":
+        return "missing" if ("missing_file" in d.notes or "broken_symlink" in d.notes) else "error"
+    return None
 
 
 async def collect(host: Any, *, endpoint_host: str, ssh: dict[str, Any], probe_fn: Callable | None = None,
-                  adapter_for: Callable[[Any], Any] | None = None, progress: ProgressFn | None = None) -> Collection:
+                  adapter_for: Callable[[Any], Any] | None = None, progress: ProgressFn | None = None,
+                  rec: JobRecorder | None = None) -> Collection:
     """Run the whole read-only discovery workflow against ``host`` (a ``RemoteHost``)."""
     from app.integrations.services.adapters import UnsupportedServiceError, get_adapter
 
     progress = progress or (lambda *_: None)
+    rec = rec or JobRecorder()
     adapter_for = adapter_for or get_adapter
     col = Collection()
+    rec.plan("connect", "probe", "resolve", "filesystem_scan", "parse", "inventory", "finalize")
     progress("probe", 10, "probing host")
+    rec.start("probe")
     col.probe = await host.probe()
+    probe = col.probe
+    svc_summary = [{"service": sp.service.value, "installed": sp.installed, "version": sp.version,
+                    "running": sp.running} for sp in probe.services]
+    rec.info("probe", f"OS detected: {probe.os_pretty} ({probe.os_family}), kernel {probe.kernel}, "
+             f"remote user {probe.remote_user}, privilege mode {probe.privilege_mode}")
+    for sp in probe.services:
+        if sp.installed:
+            rec.info("probe", f"{sp.service.value} {sp.version or 'unknown version'} detected"
+                     + (" (running)" if sp.running else ""))
+    rec.finish("probe", "ok" if probe.supported else "warning", os=probe.os_pretty, os_family=probe.os_family,
+               os_version=probe.os_version, kernel=probe.kernel, remote_user=probe.remote_user,
+               helper_version=probe.helper_version, privilege_mode=probe.privilege_mode, supported=probe.supported,
+               services=svc_summary)
+    if not probe.supported:
+        rec.warning("probe", f"operating system {probe.os_pretty} is not officially supported")
     res = _Resolver(host, endpoint_host, probe_fn, float(min(ssh.get("connect_timeout", 10), 10)))
-    installed = [sp for sp in col.probe.services if sp.installed]
+    by_service = {sp.service.value: sp for sp in probe.services}
+    for name in ("nginx", "apache", "haproxy"):
+        step = f"service:{name}"
+        if name not in by_service or not by_service[name].installed:
+            rec.skip(step, "not installed on this host", before="resolve")
+        else:
+            rec.add_step(step, before="resolve")
+    for sp in probe.services:                         # any other detected service type still gets a visible step
+        if sp.installed and sp.service.value not in ("nginx", "apache", "haproxy", "filesystem"):
+            rec.add_step(f"service:{sp.service.value}", before="resolve")
+    installed = [sp for sp in probe.services if sp.installed]
+    pending_refs: list[tuple[Any, Any]] = []
     for n, sp in enumerate(installed):
         name = sp.service.value
+        step = f"service:{name}"
         pct = 20 + int(50 * n / max(1, len(installed)))
         try:
             adapter = adapter_for(sp.service)
         except UnsupportedServiceError:
             col.notes.append(Note(None, "unsupported", f"no adapter for service {name}"))
+            rec.skip(step, "no discovery adapter for this service")
             continue
-        progress(f"service:{name}", pct, f"reading {name} configuration")
+        progress(step, pct, f"reading {name} configuration")
+        rec.start(step, version=sp.version)
         try:
             refs = await adapter.discover(host)
         except RemoteError as exc:
             col.failed_services[name] = _err_text(exc)
             col.notes.append(Note(None, "error", f"{name} configuration could not be read: {_err_text(exc)}",
                                   {"service": name, "code": exc.code.value}))
+            rec.error(step, f"{name} configuration could not be read ({exc.code.value}): {_err_text(exc)}")
+            rec.finish(step, "warning", error_code=exc.code.value, message=_err_text(exc), refs_found=0, unresolved=0)
             continue
         except Exception as exc:  # noqa: BLE001 - a parser bug on one service must not fail the whole job
             col.failed_services[name] = type(exc).__name__
             col.notes.append(Note(None, "error", f"{name} configuration could not be parsed ({type(exc).__name__})",
                                   {"service": name}))
+            rec.error(step, f"{name} configuration could not be parsed ({type(exc).__name__})")
+            rec.finish(step, "warning", error_code="DISCOVERY_PARSE_FAILED", message=type(exc).__name__,
+                       refs_found=0, unresolved=0)
             continue
         col.ok_services.add(name)
-        progress(f"service:{name}", pct + 5, f"{len(refs)} certificate reference(s) in {name}")
-        for ref in refs:
-            col.items.append(await res.resolve(ref, adapter))
+        unresolved = sum(1 for r in refs if r.unresolved_expression or not r.cert_path)
+        progress(step, pct + 5, f"{len(refs)} certificate reference(s) in {name}")
+        rec.info(step, f"{name} {sp.version or ''}: {len(refs)} certificate reference(s), {unresolved} unresolved"
+                 .replace("  ", " "))
+        rec.finish(step, "ok", version=sp.version, refs_found=len(refs), unresolved=unresolved,
+                   config_files=sorted({r.config_file for r in refs if r.config_file})[:20])
+        pending_refs.extend((r, adapter) for r in refs)
+
+    # ---- resolve every reference (stat/read of the referenced files)
+    rec.start("resolve", references=len(pending_refs))
+    counts = {"ok": 0, "missing": 0, "unreadable": 0, "errors": 0, "unsupported": 0}
+    for ref, adapter in pending_refs:
+        d = await res.resolve(ref, adapter)
+        col.items.append(d)
+        problem = _classify_problem(d)
+        label = f"{ref.service.value} {','.join(ref.server_names) or '-'} -> {ref.cert_path or '(unresolved)'}"
+        if problem == "missing":
+            counts["missing"] += 1
+            rec.warning("resolve", f"{label}: missing - {d.message}")
+        elif problem == "unreadable":
+            counts["unreadable"] += 1
+            rec.warning("resolve", f"{label}: unreadable - {d.message}")
+        elif problem == "error":
+            counts["errors"] += 1
+            rec.warning("resolve", f"{label}: {d.message}")
+        else:
+            counts["unsupported" if d.classification == "unsupported" else "ok"] += 1
+            rec.info("resolve", f"{label}: {d.classification}", {"service": ref.service.value, "line": ref.line})
+    bad = counts["missing"] + counts["unreadable"] + counts["errors"]
+    rec.finish("resolve", "warning" if bad else "ok", **counts)
+
+    # ---- filesystem scan
     progress("scan", 80, "scanning filesystem roots")
+    rec.start("filesystem_scan")
     try:
-        await _scan(host, res, ssh, col, progress)
+        scan = await _scan(host, res, ssh, col, progress, rec)
         col.ok_services.add(ServiceType.FILESYSTEM.value)
+        rec.finish("filesystem_scan", "warning" if (scan["truncated"] or scan["unreadable"]) else "ok", **scan)
     except RemoteError as exc:
         col.failed_services[ServiceType.FILESYSTEM.value] = _err_text(exc)
         col.notes.append(Note(None, "error", f"filesystem scan failed: {_err_text(exc)}"))
+        rec.error("filesystem_scan", f"filesystem scan failed ({exc.code.value}): {_err_text(exc)}")
+        rec.finish("filesystem_scan", "warning", error_code=exc.code.value, message=_err_text(exc),
+                   roots=list(ssh["discovery_roots"]), truncated=False)
     # one installation per identity (a service may declare the same cert in several blocks)
     seen: dict[tuple, DiscoveredInstallation] = {}
     for it in col.items:
         seen.setdefault((it.service_type, it.cert_path, it.vhost), it)
     col.items = list(seen.values())
+
+    # ---- parse accounting (certificates are parsed while resolving / scanning)
+    rec.finish("parse", "warning" if res.parse_errors else "ok", certificates_parsed=res.parsed,
+               parse_errors=res.parse_errors, parse_ms=int(res.parse_seconds * 1000))
     return col
 
 
 # =============================================================================================== persistence
-def persist_collection(db: Session, server: Server, col: Collection, now: datetime) -> dict[str, Any]:
+def persist_collection(db: Session, server: Server, col: Collection, now: datetime,
+                       rec: JobRecorder | None = None) -> dict[str, Any]:
     """Idempotent upsert. Returns stats + side-effect events (drift) for the caller to notify on."""
+    rec = rec or JobRecorder()
     th = inventory.thresholds(db)
     existing = {i.identity_key: i for i in db.scalars(
         select(CertificateInstallation).where(CertificateInstallation.server_id == server.id))}
     stats = {"references": len(col.items), "installations_created": 0, "installations_updated": 0,
-             "certificates_created": 0, "marked_missing": 0, "by_classification": {}}
+             "installations_unchanged": 0, "certificates_created": 0, "certificates_updated": 0, "drift_detected": 0,
+             "marked_missing": 0, "by_classification": {}}
     seen_keys: set[str] = set()
+    seen_certs: set[str] = set()
     events_out: list[dict[str, Any]] = []
     findings: list[dict[str, Any]] = []
     for d in col.items:
@@ -415,13 +561,26 @@ def persist_collection(db: Session, server: Server, col: Collection, now: dateti
         if d.cert is not None:
             cert, created_cert = inventory.upsert_certificate(db, d.cert, source=d.source, chain=d.chain, now=now, th=th)
             stats["certificates_created"] += int(created_cert)
+            if d.cert.fingerprint_sha256 not in seen_certs:
+                seen_certs.add(d.cert.fingerprint_sha256)
+                if not created_cert:
+                    stats["certificates_updated"] += 1
+                rec.info("inventory", f"certificate {'created' if created_cert else 'updated'}: "
+                         f"{d.cert.fingerprint_sha256[:16]} CN={d.cert.common_name}",
+                         {"fingerprint_sha256": d.cert.fingerprint_sha256, "common_name": d.cert.common_name})
         key = d.identity_key(server.id)
         if key in seen_keys:
             continue
         seen_keys.add(key)
         inst, created, changes = inventory.upsert_installation(db, server, d, cert, existing.get(key), now)
         stats["installations_created" if created else "installations_updated"] += 1
+        if not created and not changes:
+            stats["installations_unchanged"] += 1
         stats["by_classification"][d.classification] = stats["by_classification"].get(d.classification, 0) + 1
+        if changes.get("drift_detected"):
+            stats["drift_detected"] += 1
+            rec.warning("inventory", f"drift detected: {inst.cert_path} serves a different certificate than deployed",
+                        {"installation_id": str(inst.id)})
         if changes.get("drift_detected"):
             events_out.append({"type": "drift", "installation_id": inst.id, "cert_path": inst.cert_path, **changes["drift_detected"]})
         details: dict[str, Any] = {"installation_id": str(inst.id), "service_type": d.service_type,
@@ -444,6 +603,7 @@ def persist_collection(db: Session, server: Server, col: Collection, now: dateti
         if inst.service_type in col.ok_services:
             inst.drift_status, inst.missing_since = "missing", now
             stats["marked_missing"] += 1
+            rec.warning("inventory", f"installation no longer found, marked missing: {inst.service_type} {inst.cert_path}")
             findings.append({"path": inst.cert_path, "classification": inst.classification,
                              "message": "installation no longer found on the server",
                              "details": {"installation_id": str(inst.id), "kind": "missing"}})
@@ -463,12 +623,27 @@ def _apply_probe(server: Server, probe: HostProbe, now: datetime) -> None:
 
 
 # =============================================================================================== job lifecycle (API)
-def job_out(job: DiscoveryJob, server_name: str | None = None, findings: list[DiscoveryFinding] | None = None) -> dict[str, Any]:
+def _duration_ms(job: DiscoveryJob) -> int | None:
+    if job.started_at is None or job.finished_at is None:
+        return None
+    return max(0, int((job.finished_at - job.started_at).total_seconds() * 1000))
+
+
+def job_out(job: DiscoveryJob, server_name: str | None = None, findings: list[DiscoveryFinding] | None = None,
+            requested_by_name: str | None = None, detail: bool = False) -> dict[str, Any]:
+    """Summary view of a job; ``detail`` (or ``findings``) adds the step timeline and the sanitized log."""
+    steps = job.steps or []
     out: dict[str, Any] = {
         "id": job.id, "server_id": job.server_id, "server_name": server_name, "requested_by": job.requested_by,
-        "scheduled": job.requested_by is None, "status": job.status, "started_at": job.started_at,
-        "finished_at": job.finished_at, "stats": job.stats, "error": job.error, "created_at": job.created_at,
+        "requested_by_name": requested_by_name, "scheduled": job.requested_by is None, "status": job.status,
+        "created_at": job.created_at, "started_at": job.started_at, "finished_at": job.finished_at,
+        "duration_ms": _duration_ms(job), "stats": job.stats, "error": job.error, "error_code": job.error_code,
+        "hint": hint_for(job.error_code) if job.status == "failed" else None,
+        "warnings_count": sum(1 for st in steps if st.get("status") == "warning"),
     }
+    if detail or findings is not None:
+        out["steps"] = steps
+        out["log"] = job.log or []
     if findings is not None:
         out["findings"] = [{"id": f.id, "path": f.path, "classification": f.classification, "message": f.message,
                             "details": f.details, "created_at": f.created_at} for f in findings]
@@ -481,6 +656,7 @@ def _expire_stale(db: Session, server_id: uuid.UUID) -> None:
                                                    DiscoveryJob.status.in_(("pending", "running")),
                                                    func.coalesce(DiscoveryJob.started_at, DiscoveryJob.created_at) < cutoff)):
         j.status, j.finished_at, j.error = "failed", utcnow(), "abandoned: no progress for 30 minutes"
+        j.error_code = "DISCOVERY_ABANDONED"
     db.flush()
 
 
@@ -514,6 +690,7 @@ def _enqueue(db: Session, job: DiscoveryJob) -> None:
         enqueue("discovery.run", str(job.id))
     except Exception as exc:
         job.status, job.finished_at, job.error = "failed", utcnow(), "job queue unavailable"
+        job.error_code = "DISCOVERY_QUEUE_UNAVAILABLE"
         db.commit()
         log.error("discovery_enqueue_failed", error=type(exc).__name__)
         raise AppError("QUEUE_UNAVAILABLE", "The job queue is unavailable; try again shortly", 503) from exc
@@ -544,14 +721,16 @@ def start_bulk(db: Session, user: User, server_ids: list[uuid.UUID]) -> dict[str
 
 def list_jobs(db: Session, *, offset: int, limit: int, server_id: uuid.UUID | None = None,
               status: str | None = None) -> tuple[list[dict[str, Any]], int]:
-    stmt = select(DiscoveryJob, Server.name).join(Server, Server.id == DiscoveryJob.server_id)
+    stmt = (select(DiscoveryJob, Server.name, User.username)
+            .join(Server, Server.id == DiscoveryJob.server_id)
+            .outerjoin(User, User.id == DiscoveryJob.requested_by))
     if server_id:
         stmt = stmt.where(DiscoveryJob.server_id == server_id)
     if status:
         stmt = stmt.where(DiscoveryJob.status == status)
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     rows = db.execute(stmt.order_by(DiscoveryJob.created_at.desc()).offset(offset).limit(limit)).all()
-    return [job_out(j, name) for j, name in rows], total
+    return [job_out(j, name, requested_by_name=uname) for j, name, uname in rows], total
 
 
 def get_job(db: Session, job_id: uuid.UUID) -> dict[str, Any]:
@@ -560,7 +739,8 @@ def get_job(db: Session, job_id: uuid.UUID) -> dict[str, Any]:
         raise not_found("DISCOVERY_JOB_NOT_FOUND", "Discovery job not found")
     findings = list(db.scalars(select(DiscoveryFinding).where(DiscoveryFinding.job_id == job_id)
                                .order_by(DiscoveryFinding.created_at, DiscoveryFinding.path)))
-    return job_out(job, db.scalar(select(Server.name).where(Server.id == job.server_id)), findings)
+    uname = db.scalar(select(User.username).where(User.id == job.requested_by)) if job.requested_by else None
+    return job_out(job, db.scalar(select(Server.name).where(Server.id == job.server_id)), findings, uname)
 
 
 def schedule_due(db: Session, now: datetime | None = None) -> list[uuid.UUID]:
@@ -582,12 +762,37 @@ def schedule_due(db: Session, now: datetime | None = None) -> list[uuid.UUID]:
 
 
 # =============================================================================================== job execution (worker)
+def _code(code: str) -> str:
+    """Error codes are RemoteErrorCode values or DISCOVERY_* codes."""
+    if code in RemoteErrorCode.__members__ or code.startswith("DISCOVERY_"):
+        return code
+    return f"DISCOVERY_{code}"[:48]
+
+
+def _store(job: DiscoveryJob, rec: JobRecorder) -> None:
+    job.steps, job.log = rec.steps, rec.entries
+
+
+def _log_finished(job: DiscoveryJob, server: Server | None, status: str, error_code: str | None,
+                  stats: dict[str, Any] | None, warnings: int, duration_ms: int | None) -> None:
+    counts = {k: v for k, v in (stats or {}).items() if isinstance(v, int) and not isinstance(v, bool)}
+    log.info("discovery_finished", job_id=str(job.id), server_id=str(job.server_id),
+             server_name=server.name if server else None, status=status, duration_ms=duration_ms,
+             error_code=error_code, warnings_count=warnings, **{f"count_{k}": v for k, v in counts.items()})
+
+
 def _fail(db: Session, job: DiscoveryJob, server: Server | None, code: str, message: str, *, remote_code: str | None = None,
-          scheduled: bool = False) -> str:
+          scheduled: bool = False, rec: JobRecorder | None = None) -> str:
     from app.services.connectivity import _STATUS_BY_ERROR
 
+    code = _code(code)
+    rec = rec or JobRecorder()
     now = utcnow()
-    job.status, job.finished_at, job.error = "failed", now, f"{code}: {message}"[:1000]
+    message = sanitize_output(message, 500)
+    rec.autoflush = False
+    rec.fail_current(code, message)
+    job.status, job.finished_at, job.error, job.error_code = "failed", now, message[:1000], code
+    _store(job, rec)
     if job.stats is None:
         job.stats = {}
     if server is not None:
@@ -613,9 +818,11 @@ def _fail(db: Session, job: DiscoveryJob, server: Server | None, code: str, mess
             notifications.notify(db, "server.unreachable", "high", payload, f"server.unreachable:{job.server_id}")
     except Exception as exc:  # noqa: BLE001 - notification problems must not mask the discovery result
         log.error("discovery_notify_failed", error=type(exc).__name__)
+    duration = int((now - job.started_at).total_seconds() * 1000) if job.started_at else None
     db.commit()
+    _log_finished(job, server, "failed", code, job.stats, rec.warnings_count, duration)
     events.publish_job_event("discovery", job.id, {"type": "done", "status": "failed", "error_code": code,
-                                                   "message": message[:300], "percent": 100})
+                                                   "hint": hint_for(code), "message": message[:300], "percent": 100})
     return "failed"
 
 
@@ -640,10 +847,20 @@ def execute_job(job_id: uuid.UUID | str, *, connect_factory: Callable | None = N
         server = db.get(Server, job.server_id)
         scheduled = job.requested_by is None
         job.status, job.started_at = "running", now
+        rec = JobRecorder(jid, publish=lambda p: events.publish_job_event("discovery", jid, p))
+        rec.plan("connect", "probe", "resolve", "filesystem_scan", "parse", "inventory", "finalize")
+        _store(job, rec)
         db.commit()
+
+        def sink(steps: list[dict], entries: list[dict]) -> None:
+            job.steps, job.log = steps, entries
+            db.commit()
+
+        rec.sink = sink
         events.publish_job_event("discovery", jid, {"type": "status", "status": "running", "percent": 2,
                                                     "message": "discovery started"})
         # --- re-authorize the initiating user (rights may have changed since the request was queued)
+        rec.start("connect")
         if not scheduled:
             user = db.get(User, job.requested_by)
             try:
@@ -653,11 +870,11 @@ def execute_job(job_id: uuid.UUID | str, *, connect_factory: Callable | None = N
             except AppError as exc:
                 audit.record(db, action="DISCOVERY_FAILED", resource_type="server", resource_id=job.server_id,
                              actor=user, outcome="denied", error=exc.message)
-                return _fail(db, job, server, "AUTHORIZATION_REVOKED", exc.message, scheduled=scheduled)
+                return _fail(db, job, server, "AUTHORIZATION_REVOKED", exc.message, scheduled=scheduled, rec=rec)
         if server is None:
-            return _fail(db, job, None, "SERVER_NOT_FOUND", "server was deleted", scheduled=scheduled)
+            return _fail(db, job, None, "SERVER_NOT_FOUND", "server was deleted", scheduled=scheduled, rec=rec)
         if not server.enabled:
-            return _fail(db, job, server, "SERVER_DISABLED", "server is disabled", scheduled=scheduled)
+            return _fail(db, job, server, "SERVER_DISABLED", "server is disabled", scheduled=scheduled, rec=rec)
 
         ssh_settings = settings_service.get_section_data(db, "ssh")
         from app.services import connectivity
@@ -666,8 +883,11 @@ def execute_job(job_id: uuid.UUID | str, *, connect_factory: Callable | None = N
             target = connectivity.build_target(server, ssh_settings)
             credential = connectivity.load_credential(server)
         except AppError as exc:
-            return _fail(db, job, server, exc.code, exc.message, scheduled=scheduled)
+            return _fail(db, job, server, exc.code, exc.message, scheduled=scheduled, rec=rec)
         endpoint_host = server.address or server.hostname
+        endpoint = f"{endpoint_host}:{server.ssh_port}"
+        rec.info("connect", f"connecting to {endpoint} as {server.ssh_username}"
+                 + (" via bastion" if server.bastion_server_id else ""))
 
         def progress(stage: str, pct: int, message: str) -> None:
             events.publish_job_event("discovery", jid, {"type": "progress", "stage": stage, "percent": pct,
@@ -679,47 +899,66 @@ def execute_job(job_id: uuid.UUID | str, *, connect_factory: Callable | None = N
             cf = connect_factory or connect
             async with cf(target, credential) as host:
                 progress("connected", 8, "connected")
+                rec.info("connect", f"connected as {server.ssh_username} to {endpoint}")
+                if server.host_key_fingerprint:
+                    rec.info("connect", f"host key verified ({server.host_key_type or 'key'} {server.host_key_fingerprint})")
+                rec.finish("connect", "ok", host=endpoint_host, port=server.ssh_port, username=server.ssh_username,
+                           host_key_fingerprint=server.host_key_fingerprint, host_key_type=server.host_key_type,
+                           bastion=bool(server.bastion_server_id))
                 return await asyncio.wait_for(
                     collect(host, endpoint_host=endpoint_host, ssh=ssh_settings, probe_fn=probe_fn or _default_probe,
-                            progress=progress),
+                            progress=progress, rec=rec),
                     timeout=JOB_TIMEOUT_SECONDS)
 
         progress("connecting", 4, f"connecting to {endpoint_host}")
         try:
             col = asyncio.run(run())
         except RemoteError as exc:
-            return _fail(db, job, server, exc.code.value, exc.message, remote_code=exc.code.value, scheduled=scheduled)
+            return _fail(db, job, server, exc.code.value, exc.message, remote_code=exc.code.value,
+                         scheduled=scheduled, rec=rec)
         except TimeoutError:
-            return _fail(db, job, server, "TIMEOUT", "discovery timed out", remote_code="TIMEOUT", scheduled=scheduled)
+            return _fail(db, job, server, "DISCOVERY_TIMEOUT", "discovery timed out", remote_code="TIMEOUT",
+                         scheduled=scheduled, rec=rec)
         except AppError as exc:
-            return _fail(db, job, server, exc.code, exc.message, scheduled=scheduled)
+            return _fail(db, job, server, exc.code, exc.message, scheduled=scheduled, rec=rec)
         except Exception as exc:
             log.error("discovery_unexpected_error", job_id=str(jid), error=type(exc).__name__, exc_info=exc)
             return _fail(db, job, server, "UNEXPECTED_ERROR", f"unexpected error ({type(exc).__name__})",
-                         scheduled=scheduled)
+                         scheduled=scheduled, rec=rec)
 
         progress("persisting", 92, "saving results")
+        rec.autoflush = False                      # persist_collection runs inside one transaction: no mid-way commits
+        rec.start("inventory")
         now = utcnow()
         try:
-            result = persist_collection(db, server, col, now)
+            result = persist_collection(db, server, col, now, rec)
         except Exception as exc:
             db.rollback()
             log.error("discovery_persist_failed", job_id=str(jid), error=type(exc).__name__, exc_info=exc)
             job = db.get(DiscoveryJob, jid)
             server = db.get(Server, job.server_id)
             return _fail(db, job, server, "PERSIST_FAILED", f"could not save results ({type(exc).__name__})",
-                         scheduled=scheduled)
+                         scheduled=scheduled, rec=rec)
+        stats = result["stats"]
+        rec.finish("inventory", "ok", certificates_created=stats["certificates_created"],
+                   certificates_updated=stats["certificates_updated"],
+                   installations_created=stats["installations_created"],
+                   installations_updated=stats["installations_updated"] - stats["installations_unchanged"],
+                   installations_unchanged=stats["installations_unchanged"], marked_missing=stats["marked_missing"],
+                   drift_detected=stats["drift_detected"], findings=stats["findings"])
+        rec.start("finalize")
         if col.probe is not None:
             _apply_probe(server, col.probe, now)
         partial = bool(col.failed_services)
-        stats = result["stats"]
+        warnings = rec.warnings_count
         stats.update({"services": sorted(col.ok_services), "failed_services": col.failed_services,
-                      "duration_ms": int((now - job.started_at).total_seconds() * 1000)})
-        job.status, job.finished_at, job.stats = ("partial" if partial else "completed"), now, stats
-        job.error = ("; ".join(f"{k}: {v}" for k, v in col.failed_services.items())[:1000]) if partial else None
+                      "duration_ms": int((now - job.started_at).total_seconds() * 1000), "warnings": warnings})
+        job.status, job.finished_at, job.stats = "completed", now, stats
+        job.error, job.error_code = None, None
+        summary = ("; ".join(f"{k}: {v}" for k, v in col.failed_services.items())[:1000]) if partial else None
         server.connection_status, server.last_connected_at = "connected", now
         server.last_discovery_at, server.last_discovery_status = now, job.status
-        server.discovery_error = job.error
+        server.discovery_error = summary
         for f in result["findings"]:
             db.add(DiscoveryFinding(job_id=jid, path=f["path"], classification=f["classification"][:24],
                                     message=(f["message"] or "")[:2000], details=f["details"]))
@@ -736,10 +975,14 @@ def execute_job(job_id: uuid.UUID | str, *, connect_factory: Callable | None = N
         if partial:
             notifications.notify(db, "discovery.failed", "warning",
                                  {"server_id": str(server.id), "server_name": server.name,
-                                  "environment": server.environment, "job_id": str(jid), "error": job.error[:300],
+                                  "environment": server.environment, "job_id": str(jid), "error": summary[:300],
                                   "error_code": "PARTIAL", "scheduled": scheduled},
                                  f"discovery.partial:{server.id}:{now.strftime('%Y-%m-%d')}")
+        rec.info("finalize", f"discovery completed in {stats['duration_ms']} ms with {warnings} warning(s)")
+        rec.finish("finalize", "ok", job_status=job.status, warnings=warnings)
+        _store(job, rec)
         db.commit()
+        _log_finished(job, server, job.status, None, stats, warnings, stats["duration_ms"])
         events.publish_job_event("discovery", jid, {"type": "done", "status": job.status, "percent": 100,
                                                     "message": "discovery finished", "stats": stats})
         return job.status

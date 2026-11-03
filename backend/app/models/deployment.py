@@ -28,6 +28,9 @@ class DiscoveryJob(IdMixin, TimestampMixin, Base):
     finished_at: Mapped[datetime | None]
     stats: Mapped[dict[str, Any] | None]
     error: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(String(48))
+    steps: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
+    log: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
 
     __table_args__ = (
         in_check("status", DISCOVERY_STATUSES, "status"),

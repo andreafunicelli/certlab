@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from app.api.deps import require_permission
@@ -13,13 +14,18 @@ from app.schemas.server import (
     EnvironmentCreate,
     EnvironmentOut,
     EnvironmentUpdate,
+    HostKeyBulkEnroll,
+    HostKeyBulkEnrollOut,
+    HostKeyBulkScan,
+    HostKeyBulkScanOut,
     HostKeyEnroll,
     HostKeyScanOut,
+    ImportResultOut,
     ServerCreate,
     ServerOut,
     ServerUpdate,
 )
-from app.services import connectivity
+from app.services import connectivity, host_keys, server_import
 from app.services import servers as service
 from app.services.auth import AuthContext
 
@@ -41,6 +47,34 @@ def list_servers(
 def create_server(body: ServerCreate, ctx: AuthContext = Depends(require_permission("servers:write")),
                   db: Session = Depends(get_db)):
     return service.create(db, ctx.user, body)
+
+
+@router.get("/servers/import/template")
+def import_template(_: AuthContext = Depends(require_permission("servers:write"))):
+    return Response(server_import.template_csv(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{server_import.FILENAME}"'})
+
+
+@router.post("/servers/import", response_model=ImportResultOut)
+async def import_servers(
+    file: UploadFile = File(...), dry_run: bool = Form(True), on_conflict: Literal["error", "skip"] = Form("error"),
+    ctx: AuthContext = Depends(require_permission("servers:write")), db: Session = Depends(get_db),
+):
+    raw = await file.read(server_import.MAX_BYTES + 1)
+    return await run_in_threadpool(server_import.run_import, db, ctx.user, raw, filename=file.filename,
+                                   dry_run=dry_run, on_conflict=on_conflict)
+
+
+@router.post("/servers/host-keys/scan", response_model=HostKeyBulkScanOut)
+def bulk_scan_host_keys(body: HostKeyBulkScan, ctx: AuthContext = Depends(require_permission("servers:hostkey")),
+                        db: Session = Depends(get_db)):
+    return host_keys.scan(db, ctx.user, body.server_ids)
+
+
+@router.post("/servers/host-keys/enroll", response_model=HostKeyBulkEnrollOut)
+def bulk_enroll_host_keys(body: HostKeyBulkEnroll, ctx: AuthContext = Depends(require_permission("servers:hostkey")),
+                          db: Session = Depends(get_db)):
+    return host_keys.enroll(db, ctx.user, body)
 
 
 @router.get("/servers/{server_id}", response_model=ServerOut)

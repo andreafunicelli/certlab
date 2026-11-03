@@ -105,7 +105,8 @@ def _discovery_snapshot(db, job_id: uuid.UUID) -> dict[str, Any] | None:
     return {
         "type": "snapshot", "kind": "discovery", "job_id": str(job.id), "server_id": str(job.server_id),
         "status": job.status, "started_at": job.started_at, "finished_at": job.finished_at,
-        "stats": job.stats, "error": job.error, "finding_count": n,
+        "stats": job.stats, "error": job.error, "error_code": job.error_code, "finding_count": n,
+        "steps": job.steps or [],
     }
 
 

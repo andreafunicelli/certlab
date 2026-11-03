@@ -1,6 +1,6 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useState } from "react";
-import { Plus, Search, Radar } from "lucide-react";
+import { Pencil, Plus, Search, Radar, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { AppShell, PageHeader, Panel } from "@/components/layout/AppShell";
 import { DTable, THead, TH, TRow, TD } from "@/components/ui/dtable";
@@ -13,8 +13,10 @@ import {
   LoadingBlock,
   selectCls,
 } from "@/components/ui/feedback";
+import { EditServerDialog } from "@/components/servers/EditServerDialog";
 import { api, useEnvironments, useServers } from "@/lib/api/queries";
 import { isApiError } from "@/lib/api/client";
+import type { Server } from "@/lib/api/types";
 import { useCan } from "@/lib/auth";
 import { fmtAgo, servicesLabel } from "@/lib/format";
 
@@ -47,6 +49,8 @@ function ServersPage() {
   const canWrite = useCan("servers:write");
   const canDiscover = useCan("discovery:run");
   const envs = useEnvironments();
+  const navigate = useNavigate();
+  const [editing, setEditing] = useState<Server | null>(null);
 
   const servers = useServers({
     q: q.trim() || undefined,
@@ -86,6 +90,11 @@ function ServersPage() {
               <button onClick={() => void scanAll()} className={btnCls} disabled={!rows.length}>
                 <Radar className="size-3.5" /> Scan All
               </button>
+            )}
+            {canWrite && (
+              <Link to="/servers/import" className={btnCls}>
+                <Upload className="size-3.5" /> Import CSV
+              </Link>
             )}
             {canWrite && (
               <Link to="/servers/new" className={btnPrimaryCls}>
@@ -179,6 +188,7 @@ function ServersPage() {
               <TH>SSH Status</TH>
               <TH align="right">Certificates</TH>
               <TH>Last Check</TH>
+              {canWrite && <TH align="right">Actions</TH>}
             </THead>
             <tbody>
               {rows.map((s) => (
@@ -208,6 +218,18 @@ function ServersPage() {
                     {s.certificate_count}
                   </TD>
                   <TD className="mono">{fmtAgo(s.last_connected_at)}</TD>
+                  {canWrite && (
+                    <TD align="right">
+                      <button
+                        type="button"
+                        className={btnCls}
+                        aria-label={`Edit ${s.name}`}
+                        onClick={() => setEditing(s)}
+                      >
+                        <Pencil className="size-3.5" /> Edit
+                      </button>
+                    </TD>
+                  )}
                 </TRow>
               ))}
             </tbody>
@@ -230,6 +252,22 @@ function ServersPage() {
           </div>
         )}
       </Panel>
+      {editing && (
+        <EditServerDialog
+          server={editing}
+          onClose={() => setEditing(null)}
+          onSaved={(r) => {
+            if (!r.host_key_reset) return;
+            toast.warning("Host key cleared", {
+              description: "Verify and enroll the new host key before the server can be used.",
+              action: {
+                label: "Open server",
+                onClick: () => void navigate({ to: "/servers/$id", params: { id: r.id } }),
+              },
+            });
+          }}
+        />
+      )}
     </AppShell>
   );
 }

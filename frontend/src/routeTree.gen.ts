@@ -19,6 +19,7 @@ import { Route as DeploymentsIndexRouteImport } from './routes/deployments.index
 import { Route as DeploymentsIdRouteImport } from './routes/deployments.$id'
 import { Route as ServersIndexRouteImport } from './routes/servers.index'
 import { Route as ServersIdRouteImport } from './routes/servers.$id'
+import { Route as ServersImportRouteImport } from './routes/servers.import'
 import { Route as ServersNewRouteImport } from './routes/servers.new'
 import { Route as CertificatesIdIndexRouteImport } from './routes/certificates.$id.index'
 import { Route as CertificatesIdRenewRouteImport } from './routes/certificates.$id.renew'
@@ -73,6 +74,11 @@ const ServersIdRoute = ServersIdRouteImport.update({
   path: '/servers/$id',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ServersImportRoute = ServersImportRouteImport.update({
+  id: '/servers/import',
+  path: '/servers/import',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const ServersNewRoute = ServersNewRouteImport.update({
   id: '/servers/new',
   path: '/servers/new',
@@ -97,6 +103,7 @@ export interface FileRoutesByFullPath {
   '/settings': typeof SettingsRoute
   '/deployments/$id': typeof DeploymentsIdRoute
   '/servers/$id': typeof ServersIdRoute
+  '/servers/import': typeof ServersImportRoute
   '/servers/new': typeof ServersNewRoute
   '/certificates/': typeof CertificatesIndexRoute
   '/deployments/': typeof DeploymentsIndexRoute
@@ -112,6 +119,7 @@ export interface FileRoutesByTo {
   '/settings': typeof SettingsRoute
   '/deployments/$id': typeof DeploymentsIdRoute
   '/servers/$id': typeof ServersIdRoute
+  '/servers/import': typeof ServersImportRoute
   '/servers/new': typeof ServersNewRoute
   '/certificates': typeof CertificatesIndexRoute
   '/deployments': typeof DeploymentsIndexRoute
@@ -128,6 +136,7 @@ export interface FileRoutesById {
   '/settings': typeof SettingsRoute
   '/deployments/$id': typeof DeploymentsIdRoute
   '/servers/$id': typeof ServersIdRoute
+  '/servers/import': typeof ServersImportRoute
   '/servers/new': typeof ServersNewRoute
   '/certificates/': typeof CertificatesIndexRoute
   '/deployments/': typeof DeploymentsIndexRoute
@@ -145,6 +154,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/deployments/$id'
     | '/servers/$id'
+    | '/servers/import'
     | '/servers/new'
     | '/certificates/'
     | '/deployments/'
@@ -160,6 +170,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/deployments/$id'
     | '/servers/$id'
+    | '/servers/import'
     | '/servers/new'
     | '/certificates'
     | '/deployments'
@@ -175,6 +186,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/deployments/$id'
     | '/servers/$id'
+    | '/servers/import'
     | '/servers/new'
     | '/certificates/'
     | '/deployments/'
@@ -191,6 +203,7 @@ export interface RootRouteChildren {
   SettingsRoute: typeof SettingsRoute
   DeploymentsIdRoute: typeof DeploymentsIdRoute
   ServersIdRoute: typeof ServersIdRoute
+  ServersImportRoute: typeof ServersImportRoute
   ServersNewRoute: typeof ServersNewRoute
   CertificatesIndexRoute: typeof CertificatesIndexRoute
   DeploymentsIndexRoute: typeof DeploymentsIndexRoute
@@ -271,6 +284,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ServersIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/servers/import': {
+      id: '/servers/import'
+      path: '/servers/import'
+      fullPath: '/servers/import'
+      preLoaderRoute: typeof ServersImportRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/servers/new': {
       id: '/servers/new'
       path: '/servers/new'
@@ -303,6 +323,7 @@ const rootRouteChildren: RootRouteChildren = {
   SettingsRoute: SettingsRoute,
   DeploymentsIdRoute: DeploymentsIdRoute,
   ServersIdRoute: ServersIdRoute,
+  ServersImportRoute: ServersImportRoute,
   ServersNewRoute: ServersNewRoute,
   CertificatesIndexRoute: CertificatesIndexRoute,
   DeploymentsIndexRoute: DeploymentsIndexRoute,

@@ -209,9 +209,38 @@ def test_host_key_mismatch_fails_job_and_flags_server(admin, server_id, db):
     r = admin.post(f"/api/v1/servers/{server_id}/discover")
     assert r.status_code == 202
     job = admin.get(f"/api/v1/discovery-jobs/{r.json()['id']}").json()
-    assert job["status"] == "failed" and "HOST_KEY" in job["error"]
+    assert job["status"] == "failed" and job["error_code"] == "HOST_KEY_MISMATCH"
     db.expire_all()
     assert db.get(Server, server_id).connection_status in ("host_key_mismatch", "host_key_unknown", "error")
     assert db.get(Server, server_id).last_discovery_status == "failed"
     assert db.scalars(select(AuditEvent).where(AuditEvent.action == "DISCOVERY_FAILED")).first() is not None
     assert db.query(CertificateInstallation).count() == 0
+
+
+def test_job_has_steps_and_log(admin, server_id):
+    job = run_discovery(admin, server_id)
+    assert job["status"] == "completed", (job["error"], job["steps"])
+    steps = {s["name"]: s for s in job["steps"]}
+    for name in ("connect", "probe", "service:nginx", "service:apache", "service:haproxy", "inventory"):
+        assert steps[name]["status"] == "ok", (name, steps[name])
+    assert steps["service:nginx"]["detail"]["refs_found"] >= 1
+    assert steps["connect"]["detail"]["port"] == 2222 and steps["connect"]["detail"]["username"] == "cdpdeploy"
+    assert steps["inventory"]["detail"]["installations_created"] >= 4
+    assert job["log"] and any("connected as cdpdeploy" in e["message"] for e in job["log"])
+    assert job["error_code"] is None and job["hint"] is None
+    assert "PRIVATE KEY" not in str(job["log"])
+    lst = admin.get(f"/api/v1/servers/{server_id}/discovery-jobs").json()["items"][0]
+    assert lst["id"] == job["id"] and "steps" not in lst and lst["duration_ms"] is not None
+
+
+def test_failed_discovery_reports_code_and_hint(admin, server_id, db):
+    srv = db.get(Server, server_id)
+    srv.ssh_port = 2299                       # nothing listens here; host key stays enrolled
+    db.commit()
+    job = run_discovery(admin, server_id)
+    assert job["status"] == "failed" and job["error_code"] == "CONNECTION_REFUSED", job
+    assert job["hint"] and "SSH port" in job["hint"]
+    steps = {s["name"]: s for s in job["steps"]}
+    assert steps["connect"]["status"] == "failed" and steps["connect"]["detail"]["hint"] == job["hint"]
+    assert steps["probe"]["status"] == "skipped"
+    assert any(e["level"] == "error" for e in job["log"])

@@ -156,8 +156,8 @@ The backend maps them as shown.
 
 | Symptom | Likely cause | Check or fix |
 |---|---|---|
-| Job `partial`, `error` says "nginx: ..." (or apache, haproxy) | That service's configuration could not be read. Often `nginx -T` fails on a broken configuration. | On the target, run `nginx -t` (or the equivalent). Fix the configuration and run discovery again. Results for the other services are still saved. |
-| Job `partial`, `error` says "filesystem scan failed: ... PATH_NOT_ALLOWED" | A configured discovery root is outside `ALLOWED_ROOTS`. The whole filesystem scan stops. | Remove the root from `ssh.discovery_roots`, or add it to `ALLOWED_ROOTS` ([certificate-discovery.md](certificate-discovery.md) section 5.3). |
+| Job `completed` with warnings; the `service:nginx` step (or apache, haproxy) is `warning` | That service's configuration could not be read. Often `nginx -T` fails on a broken configuration. | On the target, run `nginx -t` (or the equivalent). Fix the configuration and run discovery again. Results for the other services are still saved. |
+| Job `completed` with warnings; the `filesystem_scan` step is `warning` with `PATH_NOT_ALLOWED` | A configured discovery root is outside `ALLOWED_ROOTS`. The whole filesystem scan stops. | Remove the root from `ssh.discovery_roots`, or add it to `ALLOWED_ROOTS` ([certificate-discovery.md](certificate-discovery.md) section 5.3). |
 | Installation `unsupported`, "unresolved expression" | The path uses a variable (`$var`, `${var}`). | There is no automatic fix. Use a literal path in the configuration. The installation cannot be deployed. |
 | Installation `unreadable`, "contains private key material and the live endpoint probe failed" | A combined PEM was read through its endpoint, and the probe did not get a certificate. | Set a reachable verify host, port and SNI with `PATCH /api/v1/installations/{id}`. Test with `POST /api/v1/installations/{id}/verify`. The backend must reach the endpoint. |
 | Installation `error`, "broken symlink" or "does not exist" | The link target or file was removed. | Restore the file, or fix the link. Discovery records the change on its next run. |

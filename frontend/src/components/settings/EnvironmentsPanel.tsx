@@ -35,6 +35,7 @@ function EnvDialog({ env, onClose }: { env: Environment | null; onClose: () => v
   const [description, setDescription] = useState(env?.description ?? "");
   const [isProd, setIsProd] = useState(env?.is_production ?? false);
   const [approval, setApproval] = useState(env?.requires_approval ?? false);
+  const [trustedChain, setTrustedChain] = useState(env?.require_trusted_chain ?? false);
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -43,6 +44,7 @@ function EnvDialog({ env, onClose }: { env: Environment | null; onClose: () => v
       description: description.trim() || null,
       is_production: isProd,
       requires_approval: approval,
+      require_trusted_chain: trustedChain,
     };
     const done = {
       onSuccess: () => {
@@ -95,6 +97,20 @@ function EnvDialog({ env, onClose }: { env: Environment | null; onClose: () => v
             Deployments require approval{" "}
             <Toggle on={approval} onChange={setApproval} label="Requires approval" />
           </div>
+          <div className="flex items-center justify-between gap-3 text-[12.5px]">
+            <span>
+              Require a trusted certificate chain
+              <span className="block text-[11.5px] text-muted-foreground">
+                Blocks deployments whose chain does not validate against the trust anchors, and
+                fails verification if the served chain is untrusted.
+              </span>
+            </span>
+            <Toggle
+              on={trustedChain}
+              onChange={setTrustedChain}
+              label="Require a trusted certificate chain"
+            />
+          </div>
           {m.error && (
             <p className="text-[12px] text-danger" role="alert">
               {errorMessage(m.error)}
@@ -146,6 +162,7 @@ export function EnvironmentsPanel() {
             <TH>Description</TH>
             <TH>Type</TH>
             <TH>Approval</TH>
+            <TH>Chain</TH>
             <TH align="right">Servers</TH>
             {canWrite && <TH align="right">Actions</TH>}
           </THead>
@@ -166,6 +183,13 @@ export function EnvironmentsPanel() {
                     <Pill tone="warn">Required</Pill>
                   ) : (
                     <Pill>Not required</Pill>
+                  )}
+                </TD>
+                <TD>
+                  {e.require_trusted_chain ? (
+                    <Pill tone="warn">Trusted only</Pill>
+                  ) : (
+                    <Pill>Any</Pill>
                   )}
                 </TD>
                 <TD align="right" className="mono tabular-nums">

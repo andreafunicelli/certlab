@@ -95,9 +95,28 @@ def create(db: Session, actor: User, data: ServerCreate) -> ServerOut:
     return to_out(s)
 
 
+def _endpoint(s: Server) -> str:
+    return f"{s.address or s.hostname}:{s.ssh_port}"
+
+
+def clear_host_key(db: Session, actor: User | None, s: Server, *, reason: str, old_endpoint: str, new_endpoint: str) -> bool:
+    """Drop the enrolled host key (never auto-trust a changed endpoint). Returns True when a key was cleared."""
+    had_key = bool(s.host_public_key or s.host_key_fingerprint)
+    old_fp = s.host_key_fingerprint
+    s.host_key_type = s.host_public_key = s.host_key_fingerprint = None
+    s.host_key_enrolled_at = s.host_key_enrolled_by = None
+    s.connection_status = "host_key_unknown"
+    if had_key:
+        audit.record(db, action="HOST_KEY_CLEARED", resource_type="server", resource_id=s.id, actor=actor,
+                     before={"fingerprint": old_fp, "endpoint": old_endpoint},
+                     after={"endpoint": new_endpoint, "reason": reason})
+    return had_key
+
+
 def update(db: Session, actor: User, server_id: uuid.UUID, data: ServerUpdate) -> ServerOut:
     s = get(db, server_id)
     before = _snapshot(s)
+    old_endpoint = _endpoint(s)
     f = data.model_fields_set
     for required in ("name", "hostname", "ssh_username", "environment", "privilege_mode", "enabled", "tags", "ssh_port"):
         if required in f and getattr(data, required) is None:
@@ -113,14 +132,18 @@ def update(db: Session, actor: User, server_id: uuid.UUID, data: ServerUpdate) -
                   "privilege_mode", "environment", "tags", "description", "enabled"):
         if field in f:
             setattr(s, field, getattr(data, field))
-    # connection-relevant changes invalidate the enrolled host key only when the address/port changed
-    if ({"hostname", "address", "ssh_port"} & f) and s.connection_status == "connected":
-        s.connection_status = "unknown"
+    # a changed endpoint invalidates the enrolled host key; the new endpoint is never trusted automatically
+    key_reset = False
+    if any(before[k] != getattr(s, k) for k in ("hostname", "address", "ssh_port")):
+        key_reset = clear_host_key(db, actor, s, reason="endpoint changed (hostname, address or SSH port)",
+                                   old_endpoint=old_endpoint, new_endpoint=_endpoint(s))
     audit.record(db, action="SERVER_UPDATED", resource_type="server", resource_id=s.id, actor=actor,
                  before=before, after=_snapshot(s))
     db.commit()
     db.refresh(s)
-    return to_out(s, repo.installation_counts(db, [s.id]).get(s.id, (0, 0)))
+    out = to_out(s, repo.installation_counts(db, [s.id]).get(s.id, (0, 0)))
+    out.host_key_reset = key_reset
+    return out
 
 
 def set_enabled(db: Session, actor: User, server_id: uuid.UUID, enabled: bool) -> ServerOut:

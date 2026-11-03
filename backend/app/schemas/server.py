@@ -138,6 +138,7 @@ class ServerOut(ORMModel):
     detected_services: Any | None
     installation_count: int = 0
     certificate_count: int = 0
+    host_key_reset: bool = False          # true only in the PATCH response that cleared the enrolled host key
     created_at: datetime
     updated_at: datetime
 
@@ -178,3 +179,79 @@ class EnvironmentOut(ORMModel):
     requires_approval: bool
     require_trusted_chain: bool = False
     server_count: int = 0
+
+
+# ------------------------------------------------------------------------------ CSV import / bulk host keys
+class ImportFieldError(BaseModel):
+    field: str
+    message: str
+
+
+class ImportHostKey(BaseModel):
+    status: Literal["not_provided", "enrolled", "mismatch", "unreachable", "pending"] = "not_provided"
+    fingerprint_expected: str | None = None
+    fingerprint_seen: str | None = None
+    error: str | None = None
+
+
+class ImportRowOut(BaseModel):
+    row: int
+    name: str | None = None
+    status: Literal["valid", "error", "skipped", "created"]
+    errors: list[ImportFieldError] = Field(default_factory=list)
+    server_id: uuid.UUID | None = None
+    host_key: ImportHostKey = Field(default_factory=ImportHostKey)
+
+
+class ImportResultOut(BaseModel):
+    dry_run: bool
+    delimiter: str
+    total: int
+    valid: int
+    invalid: int
+    skipped: int
+    created: int
+    rows: list[ImportRowOut]
+
+
+class HostKeyBulkScan(BaseModel):
+    server_ids: list[uuid.UUID] = Field(min_length=1, max_length=200)
+
+
+class HostKeyBulkScanItem(BaseModel):
+    server_id: uuid.UUID
+    server_name: str | None = None
+    endpoint: str | None = None
+    key_type: str | None = None
+    fingerprint_sha256: str | None = None
+    public_key: str | None = None
+    enrolled_fingerprint: str | None = None
+    matches_enrolled: bool | None = None
+    error_code: str | None = None
+    error: str | None = None
+
+
+class HostKeyBulkScanOut(BaseModel):
+    items: list[HostKeyBulkScanItem]
+
+
+class HostKeyBulkEnrollItem(BaseModel):
+    server_id: uuid.UUID
+    public_key: str = Field(min_length=20, max_length=8192)
+    fingerprint_sha256: str = Field(min_length=10, max_length=100)
+
+
+class HostKeyBulkEnroll(BaseModel):
+    items: list[HostKeyBulkEnrollItem] = Field(min_length=1, max_length=200)
+    replace: bool = False
+
+
+class HostKeyBulkEnrollResult(BaseModel):
+    server_id: uuid.UUID
+    status: Literal["enrolled", "error"]
+    error_code: str | None = None
+    error: str | None = None
+
+
+class HostKeyBulkEnrollOut(BaseModel):
+    items: list[HostKeyBulkEnrollResult]

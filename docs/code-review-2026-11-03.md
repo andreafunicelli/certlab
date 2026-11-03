@@ -17,36 +17,14 @@ seconda review del diff. Non equivale a un penetration test o a una certificazio
 | P1 | Helper privilegiato: `install` e `write-staged` accettavano bit setuid/setgid/sticky, incluso un file root con modo `4755` nelle directory ammesse. | Rifiuto dei bit speciali nel validatore shell e nel client SSH. Test dei validatori reali, senza installare o eseguire un payload privilegiato. La portata delle directory ammesse resta un limite distinto, descritto sotto. |
 | P2 | Upload multipart di una chiave non UTF-8: il decode era fuori dal blocco che gestiva `UnicodeDecodeError`, producendo un errore 500. | Errore applicativo 422 nel punto del decode, verificato sia per creazione sia per rotazione delle credenziali. |
 | P2 | Regole di notifica con filtro ambiente numerico o strutturato: la configurazione veniva salvata e poteva provocare `TypeError` nel routing, interrompendo monitoraggio/discovery. | Validazione di stringa o lista di stringhe prima del salvataggio; regressioni per tipi non ammessi. Le regole malformate eventualmente già presenti nel database vanno corrette. |
+| P1 | Revoca dell'utente durante un deploy interrotto: `JobRunner._run` chiamava `_abort`, che marcava come cancellati anche target a metà modifica (file chiave/certificato sostituiti solo in parte) senza riconciliarli. | Autorizzazione a proseguire e recupero di sicurezza sono ora separati (`JobRunner._authz_revoked`, `UnitRunner._resume_revoked`). Target mai partiti: `cancelled` (`AUTHZ`). Target che possono aver modificato file (stati di modifica o `activated`/`reload_started` persistiti): lock, riconciliazione e, se qualcosa differisce dal backup (o la riconciliazione non prova che nulla è cambiato), ripristino dal backup verificato (config test, reload solo se iniziato, file e fingerprint precedente serviti) → `rolled_back` (`AUTHZ_REVOKED`), altrimenti `manual_intervention_required`. Mai avanzamento. Audit con attore `deployment-engine` (`DEPLOYMENT_AUTHZ_REVOKED`, `DEPLOYMENT_AUTHZ_REVOKED_RECOVERY`) con l'utente revocato; notifiche `rollback.triggered`/`rollback.failed`. Regressioni in `tests/unit/deploy/test_revoked_and_shared_restore.py`: crash tra le due installazioni → utente disabilitato/eliminato → riconsegna (file uguali al backup), crash con tutti i file nuovi, ripristino impossibile e non verificato (`manual_intervention_required`), nessuna modifica avvenuta (`cancelled`), fase di staging e unità mista. |
+| P1 | Restore manuale di un backup condiviso tra servizi: `restore_backup_async` ripristinava l'intero manifest ma bloccava, ricaricava, verificava e aggiornava soltanto l'installazione primaria/il target richiesto (nginx ricaricato, Apache poteva servire ancora il certificato nuovo). | Nuovo `resolve_restore_scope`: tutti i target con lo stesso `backup_id` (o, per backup senza deployment, tutte le installazioni del server i cui percorsi compaiono nel manifest). Lock di ogni servizio e file, ripristino unico, config test di ogni servizio, reload (stessa regola dell'engine: solo se un reload era iniziato o il deploy era `completed`), verifica positiva del fingerprint precedente su ogni endpoint, poi inventario e stato di tutti i target/installazioni. Qualsiasi errore → tutti `manual_intervention_required`, con il servizio che ha fallito nel messaggio. `POST /deployments/{id}/targets/{tid}/rollback` usa la stessa routine (ripristina l'intera unità; la risposta lo dichiara con `unit_target_ids`, `services` e `message`). Regressioni nello stesso file di test (due servizi con file condivisi, fallimento nella verifica del secondo, config test, lock di servizio, API, backup senza deployment). Nessun test live: il target di test locale non ha un percorso cert/chiave condiviso tra nginx e Apache. |
 
-Le regressioni sono state osservate fallire prima delle rispettive correzioni.
+Le regressioni sono state osservate fallire prima delle rispettive correzioni. Eccezione: i test del restore condiviso usano le nuove API di risoluzione dello scope e non possono essere eseguiti sul codice precedente.
 
 ## Difetti aperti, da affrontare separatamente
 
 Questi rilievi derivano dal tracciamento del codice; gli scenari remoti non sono stati riprodotti su server reali.
-
-### P1 — Revoca dell'utente durante un deploy interrotto
-
-In `backend/app/services/deployment_engine.py`, `JobRunner._run` riautorizza l'utente prima del recupero e
-chiama `_abort` se è stato disabilitato, eliminato o privato del ruolo. `_abort` marca come cancellati anche
-target che erano in una fase di modifica remota, senza riconciliarli.
-
-Scenario: il worker muore tra la sostituzione di chiave e certificato; l'utente viene disabilitato; il task
-viene riconsegnato. I file possono restare incoerenti e il target risultare semplicemente cancellato.
-Il recupero di sicurezza deve essere distinto dall'autorizzazione a proseguire il deploy: acquisire i lock,
-riconciliare/ripristinare e verificare oppure segnalare esplicitamente la necessità di intervento manuale.
-Occorre una regressione con crash a metà installazione, revoca e riconsegna del task.
-
-### P1 — Restore manuale di un backup condiviso tra servizi
-
-`UnitRunner` associa lo stesso backup a tutti i target di un'unità che condivide file.
-`restore_backup_async` ripristina l'intero manifest, ma acquisisce il lock di servizio, ricarica, verifica
-e aggiorna l'inventario soltanto dell'installazione primaria o del target richiesto.
-
-Scenario: nginx e Apache condividono materiale TLS; il deploy aggiorna entrambi; un restore manuale
-ripristina i file precedenti ma ricarica soltanto il servizio primario. Il secondo può continuare a servire
-il certificato nuovo mentre file e stato non lo rappresentano correttamente. Il restore deve risolvere
-tutti i target/servizi/endpoint associati al backup e trattarli come un'unica unità.
-Fino alla correzione, evitare questo restore manuale su backup condivisi e gestire il recupero con una procedura controllata.
 
 ### P2 — Scadenziario incompleto oltre 200 certificati
 

@@ -646,7 +646,12 @@ export function DeploymentLive({
           }
         }}
         title={`Roll back ${rb?.server_name ?? "server"}?`}
-        description="The files replaced by this deployment are restored from the verified backup, the service config is tested and reloaded. This changes the certificate served by that server."
+        description={
+          "The files replaced by this deployment are restored from the verified backup, the service config is tested and reloaded. This changes the certificate served by that server." +
+          ((rb?.shared_with?.length ?? 0) > 0
+            ? ` These files are shared with ${rb?.shared_with.length} other installation(s): the whole unit is restored, every affected service is reloaded and verified, and all of its targets change status.`
+            : "")
+        }
         confirmLabel="Restore backup"
         destructive
         pending={act.rollback.isPending}
@@ -659,7 +664,10 @@ export function DeploymentLive({
               act.rollback.mutateAsync({ id: job.id, targetId: t.id }).then((r) => {
                 if (r.accepted)
                   toast.info("Rollback queued", {
-                    description: `${t.server_name ?? "Target"}: the status updates live when the worker finishes.`,
+                    description:
+                      (r.unit_target_ids?.length ?? 1) > 1
+                        ? r.message
+                        : `${t.server_name ?? "Target"}: the status updates live when the worker finishes.`,
                   });
                 else toast.error("Rollback was not accepted");
                 setRb(null);
